@@ -33,6 +33,8 @@ from typing import Any
 
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
+from pptx.shapes.graphfrm import GraphicFrame
+from pptx.shapes.picture import Picture
 
 # python-pptx's shape base class (pptx.shapes.base.BaseShape) is not
 # re-exported from pptx.shapes' top level in 1.0.2 - confirmed by
@@ -64,21 +66,28 @@ def _is_title_shape(shape: BaseShape) -> bool:
 
 
 def _is_smartart(shape: BaseShape) -> bool:
-    """SmartArt is a graphicFrame whose graphicData uri points at the
-    OOXML diagram namespace. python-pptx doesn't expose a has_smartart
-    flag, so this checks the underlying XML directly - see module
-    docstring re: unverified-by-fixture status."""
+    """SmartArt is always a graphicFrame whose graphicData uri points
+    at the OOXML diagram namespace. Gated on isinstance(shape,
+    GraphicFrame) FIRST (not just shape_type != CHART) - the prior
+    version ran an unbounded `.//` XML subtree search on every single
+    non-chart shape, which is real, avoidable cost at 100MB/many-
+    shapes scale. python-pptx doesn't expose a has_smartart flag, so
+    the underlying XML still has to be checked directly - see module
+    docstring re: unverified-by-fixture status for the diagram-uri
+    match itself."""
 
-    if shape.shape_type != MSO_SHAPE_TYPE.CHART and hasattr(shape, "_element"):
-        try:
-            graphic_data = shape._element.find(
-                ".//{http://schemas.openxmlformats.org/drawingml/2006/main}graphicData"
-            )
-            if graphic_data is not None:
-                uri = graphic_data.get("uri", "")
-                return uri == _DIAGRAM_NS_URI
-        except AttributeError:
-            return False
+    if not isinstance(shape, GraphicFrame):
+        return False
+
+    try:
+        graphic_data = shape._element.find(
+            ".//{http://schemas.openxmlformats.org/drawingml/2006/main}graphicData"
+        )
+        if graphic_data is not None:
+            uri = graphic_data.get("uri", "")
+            return uri == _DIAGRAM_NS_URI
+    except AttributeError:
+        return False
     return False
 
 
@@ -195,7 +204,18 @@ def _process_shape(
                     )
         return
 
-    if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+    is_picture = (
+        shape.shape_type == MSO_SHAPE_TYPE.PICTURE or isinstance(shape, Picture)
+    )
+    # isinstance() check is the load-bearing one: a POPULATED picture
+    # placeholder (python-pptx's PlaceholderPicture) is a genuine
+    # Picture subclass with a working .image.blob, but its shape_type
+    # reports MSO_SHAPE_TYPE.PLACEHOLDER, not PICTURE - reproduced
+    # directly against a real "Picture with Caption" layout during
+    # verification. Without the isinstance() check, populated picture
+    # placeholders silently vanished entirely (matched none of the
+    # branches below, no error, no flag - just gone).
+    if is_picture:
         try:
             image = shape.image
             parsed.unsupported_items.append(
@@ -239,15 +259,35 @@ def _process_shape(
             )
         return
 
-    if shape.shape_type == MSO_SHAPE_TYPE.EMBEDDED_OLE_OBJECT:
+    if shape.shape_type in (
+        MSO_SHAPE_TYPE.EMBEDDED_OLE_OBJECT,
+        MSO_SHAPE_TYPE.LINKED_OLE_OBJECT,
+    ):
         parsed.unsupported_items.append(
             UnsupportedItem(
                 kind=UnsupportedKind.EMBEDDED_OBJECT,
                 location=location,
-                note="OLE-embedded object - no extraction path in current scope",
+                note="OLE-embedded/linked object - no extraction path in current scope",
                 extraction_status=ExtractionStatus.NOT_APPLICABLE,
             )
         )
+        return
+
+    # SAFETY NET: anything reaching here (movies/media, connectors,
+    # and any other shape type not explicitly handled above) would
+    # previously vanish with no trace - no block, no unsupported
+    # item, no log. Flagging generically instead means nothing is
+    # ever silently dropped, and this branch firing during real-file
+    # testing is itself a signal that a new shape category needs its
+    # own explicit handling.
+    parsed.unsupported_items.append(
+        UnsupportedItem(
+            kind=UnsupportedKind.EMBEDDED_OBJECT,
+            location=location,
+            note=f"unhandled shape type ({shape.shape_type}) - not reviewed",
+            extraction_status=ExtractionStatus.NOT_APPLICABLE,
+        )
+    )
 
 
 def parse_pptx(file_bytes: bytes, filename: str) -> ParsedDocument:
