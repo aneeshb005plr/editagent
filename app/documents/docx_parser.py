@@ -21,6 +21,17 @@ requirement for full document reconstruction appears.
 NOT YET LOAD-TESTED AT 100MB - python-docx loads the full document
 into memory; this is the parser most in need of the large-file
 spike flagged in the architecture doc.
+
+EXPLICITLY OUT OF SCOPE, not silently missing: headers, footers,
+footnotes/endnotes, and textboxes live in separate document parts
+that doc.paragraphs/doc.tables never touch - none of this content
+is reviewed OR flagged as unsupported; it's simply not visited at
+all. Stated here explicitly rather than left implicit, since
+"readable content" could otherwise be assumed to mean everything in
+the file. Revisit if review coverage for these sections becomes a
+real requirement - each is a genuinely separate python-docx access
+path (doc.sections[i].header/.footer, etc.), not a small extension
+of the current paragraph walk.
 """
 
 from __future__ import annotations
@@ -29,7 +40,12 @@ import io
 import logging
 
 from docx import Document as DocxDocument
-from docx.table import Table
+from docx.image.exceptions import (
+    InvalidImageStreamError,
+    UnexpectedEndOfFileError,
+    UnrecognizedImageError,
+)
+from docx.oxml.ns import nsmap, qn
 from docx.text.paragraph import Paragraph
 
 from app.documents.base import (
@@ -48,21 +64,18 @@ _WORD_DRAWING_NS = (
     "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
 )
 _INLINE_TAG = f"{_WORD_DRAWING_NS}inline"
+_ANCHOR_TAG = f"{_WORD_DRAWING_NS}anchor"
 _GRAPHIC_DATA_TAG = (
     "{http://schemas.openxmlformats.org/drawingml/2006/main}graphicData"
 )
 
-# Charts and SmartArt in Word use the SAME wp:inline wrapper as
-# pictures - all three are only distinguishable by graphicData's uri
-# attribute. Confirmed by inspecting real generated XML (a python-
-# pptx chart's uri, reused here since Word/PowerPoint share the same
-# OOXML drawing schema for this), not assumed. Getting this wrong
-# previously meant charts/SmartArt fell into the picture-extraction
-# path and failed there with a misleading "unparseable inline image
-# structure" note instead of being correctly identified.
-_PICTURE_URI = "http://schemas.openxmlformats.org/drawingml/2006/picture"
-_CHART_URI = "http://schemas.openxmlformats.org/drawingml/2006/chart"
-_DIAGRAM_URI = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+# Sourced from python-docx's OWN nsmap rather than hardcoded strings -
+# these values were verified to already be correct by direct
+# comparison, but importing from the library's source of truth
+# prevents any future drift, per review feedback.
+_PICTURE_URI = nsmap["pic"]
+_CHART_URI = nsmap["c"]
+_DIAGRAM_URI = nsmap["dgm"]
 
 # Object/OLE embed tags live in a different namespace - checked broadly
 # via localname to avoid a second namespace-map maintenance burden.
@@ -77,7 +90,7 @@ def _is_heading(paragraph: Paragraph) -> bool:
 
 
 def _extract_picture(
-    inline,
+    graphic_el,
     doc: DocxDocument,
     paragraph_index: int,
 ) -> UnsupportedItem:
@@ -87,34 +100,37 @@ def _extract_picture(
     Confirmed API (python-docx 1.2.0): doc.part.related_parts is a
     dict keyed by relationship id -> Part. There is no
     related_part(rId) method on DocumentPart in this version.
+
+    Handles two real cases beyond the straightforward embedded-raster
+    path, both confirmed rather than assumed:
+    - LINKED (not embedded) pictures use r:link instead of r:embed -
+      blip.embed is None for these, which previously got misreported
+      as a generic parse failure. Now correctly identified and
+      flagged as linked rather than broken.
+    - EMF/WMF and other vector/unusual image formats: image_part.
+      image.blob raises UnrecognizedImageError/InvalidImageStreamError
+      /UnexpectedEndOfFileError from docx.image.exceptions - confirmed
+      these are plain Exception subclasses, NOT AttributeError, so a
+      bare `except AttributeError` does not catch them and the whole
+      parse would crash on a real, common case (e.g. a pasted Excel
+      chart or Visio object saved as EMF). Falls back to the part's
+      raw .blob (bytes without python-docx's own format parsing/
+      validation) rather than crash.
     """
 
-    try:
-        blip = inline.graphic.graphicData.pic.blipFill.blip
-        r_id = blip.embed
+    # Navigate via raw XML find(), NOT the .graphic convenience
+    # attribute - confirmed by testing that CT_Anchor (floating/
+    # wrapped images) does not expose .graphic the way CT_Inline
+    # does (AttributeError: 'CT_Anchor' object has no attribute
+    # 'graphic'). This approach works identically for both.
+    a_ns = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+    blip = graphic_el.find(f".//{a_ns}blip")
 
-        if r_id is None:
-            raise AttributeError("blip has no embed rId")
-
-        image_part = doc.part.related_parts.get(r_id)
-
-        if image_part is None:
-            raise AttributeError(f"could not resolve part for rId={r_id}")
-
-        return UnsupportedItem(
-            kind=UnsupportedKind.IMAGE,
-            location=Location(paragraph_index=paragraph_index),
-            note=f"content_type={image_part.content_type}",
-            raw_bytes=image_part.image.blob,
-            extraction_status=ExtractionStatus.PENDING,
-        )
-
-    except AttributeError:
+    if blip is None:
         logger.warning(
-            "Unexpected inline picture structure in paragraph %d - "
-            "flagging without extraction",
+            "Graphic in paragraph %d has no blip element - flagging "
+            "without extraction",
             paragraph_index,
-            exc_info=True,
         )
         return UnsupportedItem(
             kind=UnsupportedKind.IMAGE,
@@ -123,32 +139,104 @@ def _extract_picture(
             extraction_status=ExtractionStatus.FAILED,
         )
 
+    r_id = blip.get(qn("r:embed"))
+
+    if r_id is None:
+        link_r_id = blip.get(qn("r:link"))
+        if link_r_id is not None:
+            return UnsupportedItem(
+                kind=UnsupportedKind.IMAGE,
+                location=Location(paragraph_index=paragraph_index),
+                note="linked (not embedded) image - no local bytes to extract",
+                extraction_status=ExtractionStatus.NOT_APPLICABLE,
+            )
+        logger.warning(
+            "Inline picture in paragraph %d has neither r:embed nor "
+            "r:link - flagging without extraction",
+            paragraph_index,
+        )
+        return UnsupportedItem(
+            kind=UnsupportedKind.IMAGE,
+            location=Location(paragraph_index=paragraph_index),
+            note="unparseable inline picture structure",
+            extraction_status=ExtractionStatus.FAILED,
+        )
+
+    image_part = doc.part.related_parts.get(r_id)
+
+    if image_part is None:
+        logger.warning(
+            "Could not resolve part for rId=%s in paragraph %d",
+            r_id,
+            paragraph_index,
+        )
+        return UnsupportedItem(
+            kind=UnsupportedKind.IMAGE,
+            location=Location(paragraph_index=paragraph_index),
+            note=f"could not resolve part for rId={r_id}",
+            extraction_status=ExtractionStatus.FAILED,
+        )
+
+    try:
+        raw_bytes = image_part.image.blob
+        content_type = image_part.content_type
+    except (
+        UnrecognizedImageError,
+        InvalidImageStreamError,
+        UnexpectedEndOfFileError,
+    ):
+        # python-docx's own image-format parsing failed (EMF/WMF and
+        # similar are common real-world triggers) - fall back to the
+        # part's raw bytes, which exist regardless of whether python-
+        # docx can parse the format's header.
+        logger.info(
+            "Image in paragraph %d is in a format python-docx can't "
+            "parse (likely EMF/WMF) - using raw part bytes instead",
+            paragraph_index,
+        )
+        raw_bytes = image_part.blob
+        content_type = getattr(image_part, "content_type", "unknown")
+
+    return UnsupportedItem(
+        kind=UnsupportedKind.IMAGE,
+        location=Location(paragraph_index=paragraph_index),
+        note=f"content_type={content_type}",
+        raw_bytes=raw_bytes,
+        extraction_status=ExtractionStatus.PENDING,
+    )
+
 
 def _extract_inline_graphics(
     paragraph: Paragraph,
     doc: DocxDocument,
     paragraph_index: int,
 ) -> list[UnsupportedItem]:
-    """Finds every inline graphic (picture, chart, or SmartArt) inside
-    this paragraph and routes each to the right handling by inspecting
-    graphicData's uri - NOT by assuming every inline is a picture,
-    which was the previous (incorrect) behavior. Charts/SmartArt in
-    Word have no python-docx API support at all (confirmed: no
-    docx.chart module exists), so - matching pptx_parser's approach -
-    they're flagged only, never label-extracted the way PowerPoint
-    charts are; that PPT-specific capability has no Word equivalent
-    with the current library, worth knowing rather than assuming
-    parity across formats."""
+    """Finds every graphic (picture, chart, or SmartArt) inside this
+    paragraph - both INLINE (wp:inline, flows with text) and FLOATING/
+    WRAPPED (wp:anchor, positioned with text wrap) - and routes each
+    to the right handling by inspecting graphicData's uri. Searching
+    only wp:inline was a real, silent coverage gap: any image with
+    text wrapping applied (a common real-world formatting choice, not
+    an edge case) uses wp:anchor instead and was previously invisible
+    to this parser entirely - not flagged, not extracted, just absent.
+
+    Charts/SmartArt in Word have no python-docx API support at all
+    (confirmed: no docx.chart module exists), so - matching
+    pptx_parser's approach - they're flagged only, never label-
+    extracted the way PowerPoint charts are; that PPT-specific
+    capability has no Word equivalent with the current library."""
 
     items: list[UnsupportedItem] = []
-    inline_elements = paragraph._p.findall(f".//{_INLINE_TAG}")
+    graphic_elements = paragraph._p.findall(f".//{_INLINE_TAG}") + paragraph._p.findall(
+        f".//{_ANCHOR_TAG}"
+    )
 
-    for inline in inline_elements:
-        graphic_data = inline.find(f".//{_GRAPHIC_DATA_TAG}")
+    for graphic_el in graphic_elements:
+        graphic_data = graphic_el.find(f".//{_GRAPHIC_DATA_TAG}")
         uri = graphic_data.get("uri", "") if graphic_data is not None else ""
 
         if uri == _PICTURE_URI:
-            items.append(_extract_picture(inline, doc, paragraph_index))
+            items.append(_extract_picture(graphic_el, doc, paragraph_index))
 
         elif uri == _CHART_URI:
             items.append(
@@ -176,9 +264,8 @@ def _extract_inline_graphics(
 
         else:
             logger.warning(
-                "Inline graphic in paragraph %d has unrecognized "
-                "graphicData uri=%r - flagging as unsupported without "
-                "extraction",
+                "Graphic in paragraph %d has unrecognized graphicData "
+                "uri=%r - flagging as unsupported without extraction",
                 paragraph_index,
                 uri,
             )
@@ -248,19 +335,34 @@ def parse_docx(file_bytes: bytes, filename: str) -> ParsedDocument:
     for table_idx, table in enumerate(doc.tables):
         for row_idx, row in enumerate(table.rows):
             for col_idx, cell in enumerate(row.cells):
-                cell_text = cell.text.strip()
-                if cell_text:
-                    parsed.blocks.append(
-                        ContentBlock(
-                            text=cell_text,
-                            kind=ContentKind.TABLE_CELL,
-                            location=Location(
-                                table_index=table_idx,
-                                row_index=row_idx,
-                                column_index=col_idx,
-                            ),
+                cell_location = Location(
+                    table_index=table_idx,
+                    row_index=row_idx,
+                    column_index=col_idx,
+                )
+
+                for cell_paragraph in cell.paragraphs:
+                    cell_text = cell_paragraph.text.strip()
+                    if cell_text:
+                        parsed.blocks.append(
+                            ContentBlock(
+                                text=cell_text,
+                                kind=ContentKind.TABLE_CELL,
+                                location=cell_location,
+                            )
                         )
+
+                    # Real gap, now fixed: table cells can contain
+                    # images/charts/SmartArt just like body paragraphs
+                    # can - doc.tables only exposed cell.text
+                    # previously, silently dropping any graphic
+                    # embedded inside a cell.
+                    graphics = _extract_inline_graphics(
+                        cell_paragraph, doc, table_idx
                     )
+                    for item in graphics:
+                        item.location = cell_location
+                    parsed.unsupported_items.extend(graphics)
 
     logger.info(
         "Parsed %s: %d text blocks, %d unsupported items (%.0f chars)",
