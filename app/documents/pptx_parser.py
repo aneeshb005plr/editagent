@@ -34,7 +34,7 @@ from typing import Any
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
 from pptx.shapes.graphfrm import GraphicFrame
-from pptx.shapes.picture import Picture
+from pptx.shapes.picture import Movie, Picture
 
 # python-pptx's shape base class (pptx.shapes.base.BaseShape) is not
 # re-exported from pptx.shapes' top level in 1.0.2 - confirmed by
@@ -297,13 +297,55 @@ def _process_shape(
         )
         return
 
-    # SAFETY NET: anything reaching here (movies/media, connectors,
-    # and any other shape type not explicitly handled above) would
-    # previously vanish with no trace - no block, no unsupported
-    # item, no log. Flagging generically instead means nothing is
-    # ever silently dropped, and this branch firing during real-file
-    # testing is itself a signal that a new shape category needs its
-    # own explicit handling.
+    if shape.shape_type == MSO_SHAPE_TYPE.MEDIA:
+        # Movie and Picture are SIBLINGS under _BasePicture in
+        # python-pptx (confirmed via source: class Movie(_BasePicture),
+        # class Picture(_BasePicture)) - NOT parent/child - so a movie
+        # was never actually caught by the isinstance(shape, Picture)
+        # check above, and correctly wasn't silently dropped either
+        # (it would have reached the safety net below). But it WAS
+        # being mislabeled as generic EMBEDDED_OBJECT, discarding a
+        # movie's poster frame - a real, extractable image (confirmed
+        # via Movie.poster_frame's actual source) - along the way.
+        # This branch classifies media correctly and recovers that
+        # poster-frame image for review like any other picture.
+        # Covers both video (has a poster frame, usually) and audio
+        # (PP_MEDIA_TYPE.SOUND also reports shape_type MEDIA, has no
+        # poster frame - handled by the None check below).
+        poster_frame = getattr(shape, "poster_frame", None)
+        if poster_frame is not None:
+            parsed.unsupported_items.append(
+                UnsupportedItem(
+                    kind=UnsupportedKind.IMAGE,
+                    location=location,
+                    note=(
+                        f"video poster frame, content_type="
+                        f"{poster_frame.content_type}"
+                    ),
+                    raw_bytes=poster_frame.blob,
+                    extraction_status=ExtractionStatus.PENDING,
+                )
+            )
+        else:
+            parsed.unsupported_items.append(
+                UnsupportedItem(
+                    kind=UnsupportedKind.EMBEDDED_OBJECT,
+                    location=location,
+                    note="media (video/audio) - no poster frame available",
+                    extraction_status=ExtractionStatus.NOT_APPLICABLE,
+                )
+            )
+        return
+
+    # SAFETY NET: anything reaching here (connectors and any other
+    # shape type not explicitly handled above) would previously
+    # vanish with no trace - no block, no unsupported item, no log.
+    # Flagging generically instead means nothing is ever silently
+    # dropped, and this branch firing during real-file testing is
+    # itself a signal that a new shape category needs its own
+    # explicit handling. (Media used to be listed here too, but has
+    # its own branch above now - it was never actually silently
+    # dropped, just mislabeled when it landed here.)
     parsed.unsupported_items.append(
         UnsupportedItem(
             kind=UnsupportedKind.EMBEDDED_OBJECT,

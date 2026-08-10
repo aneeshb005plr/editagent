@@ -8,15 +8,22 @@ library rather than assumed from memory (document.part.related_parts
 is a dict, NOT a related_part() method - that would have been a
 real bug if guessed).
 
-KNOWN SIMPLIFICATION, deliberate for MVP: paragraphs and tables are
-each processed in their own document order, but paragraph-vs-table
-INTERLEAVING order is not preserved (python-docx has no built-in
-body-order iterator; doing this properly means walking
-document.element.body's raw XML children and dispatching by tag,
-which adds real complexity for something review findings don't
-need - a finding's location matters, its position relative to a
-table three paragraphs later does not). Revisit only if a real
-requirement for full document reconstruction appears.
+KNOWN SIMPLIFICATION, previously present, now RESOLVED: paragraph-vs-
+table interleaving order was not preserved by the old doc.paragraphs
++ doc.tables approach. This is now fixed via doc.iter_inner_content()
+(and _Cell.iter_inner_content() for nested content), confirmed to
+exist and yield correct document order in python-docx 1.2.0. This
+same refactor also fixes nested tables (see below) - both were the
+same underlying limitation of the old flat-loop approach.
+
+NESTED TABLES ARE NOW HANDLED: a table inside a table cell is
+invisible to doc.tables entirely (python-docx's own documentation
+states only top-level tables appear there) - confirmed by direct
+reproduction, where a nested table's content did not appear via the
+old doc.tables-based approach at all. _process_table now recurses
+into any table found via cell.iter_inner_content(), at any nesting
+depth, using the same table_counter so nested tables get their own
+distinct table_index rather than colliding with their parent's.
 
 NOT YET LOAD-TESTED AT 100MB - python-docx loads the full document
 into memory; this is the parser most in need of the large-file
@@ -63,6 +70,7 @@ from docx.image.exceptions import (
     UnrecognizedImageError,
 )
 from docx.oxml.ns import nsmap, qn
+from docx.table import Table
 from docx.text.paragraph import Paragraph
 
 from app.documents.base import (
@@ -373,6 +381,83 @@ def _has_ole_object(paragraph: Paragraph) -> bool:
     return False
 
 
+def _process_paragraph(
+    paragraph: Paragraph,
+    location: Location,
+    doc: DocxDocument,
+    parsed: ParsedDocument,
+    kind_if_text: ContentKind,
+) -> None:
+    """Shared logic for handling one paragraph's text + graphics + OLE
+    at an already-determined location. Used identically for body-level
+    paragraphs and paragraphs inside table cells (including nested
+    table cells) - the only difference between call sites is what
+    Location and ContentKind get passed in."""
+
+    text = paragraph.text.strip()
+    if text:
+        parsed.blocks.append(
+            ContentBlock(text=text, kind=kind_if_text, location=location)
+        )
+
+    graphics = _extract_inline_graphics(paragraph, doc, location.display())
+    for item in graphics:
+        item.location = location
+    parsed.unsupported_items.extend(graphics)
+
+    if _has_ole_object(paragraph):
+        parsed.unsupported_items.append(
+            UnsupportedItem(
+                kind=UnsupportedKind.EMBEDDED_OBJECT,
+                location=location,
+                note="OLE-embedded object - no extraction path in current scope",
+                extraction_status=ExtractionStatus.NOT_APPLICABLE,
+            )
+        )
+
+
+def _process_table(
+    table: Table,
+    doc: DocxDocument,
+    parsed: ParsedDocument,
+    table_counter: list[int],
+) -> None:
+    """Processes a table's cells, RECURSING into any nested tables
+    found via cell.iter_inner_content() - a table inside a cell is
+    invisible to doc.tables entirely (confirmed: python-docx's own
+    docs state only top-level tables appear there), and was
+    completely unhandled before this refactor - no block, no
+    unsupported item, silently absent. table_counter is shared and
+    incremented for every table encountered at ANY nesting level, so
+    nested tables get their own distinct table_index rather than
+    colliding with their parent's."""
+
+    this_table_index = table_counter[0]
+    table_counter[0] += 1
+
+    for row_idx, row in enumerate(table.rows):
+        for col_idx, cell in enumerate(row.cells):
+            cell_location = Location(
+                table_index=this_table_index,
+                row_index=row_idx,
+                column_index=col_idx,
+            )
+
+            for cell_item in cell.iter_inner_content():
+                if isinstance(cell_item, Paragraph):
+                    _process_paragraph(
+                        cell_item,
+                        cell_location,
+                        doc,
+                        parsed,
+                        ContentKind.TABLE_CELL,
+                    )
+                else:
+                    # A Table nested inside this cell - recurse using
+                    # the exact same machinery, at any depth.
+                    _process_table(cell_item, doc, parsed, table_counter)
+
+
 def parse_docx(file_bytes: bytes, filename: str) -> ParsedDocument:
     """Parses a .docx file's readable content into a ParsedDocument.
 
@@ -385,84 +470,20 @@ def parse_docx(file_bytes: bytes, filename: str) -> ParsedDocument:
     doc = DocxDocument(io.BytesIO(file_bytes))
     parsed = ParsedDocument(source_filename=filename, file_type="docx")
 
-    for idx, paragraph in enumerate(doc.paragraphs):
-        text = paragraph.text.strip()
-        location = Location(paragraph_index=idx)
+    paragraph_counter = [0]
+    table_counter = [0]
 
-        if text:
+    for item in doc.iter_inner_content():
+        if isinstance(item, Paragraph):
+            idx = paragraph_counter[0]
+            paragraph_counter[0] += 1
+            location = Location(paragraph_index=idx)
             kind = (
-                ContentKind.HEADING
-                if _is_heading(paragraph)
-                else ContentKind.PARAGRAPH
+                ContentKind.HEADING if _is_heading(item) else ContentKind.PARAGRAPH
             )
-            parsed.blocks.append(
-                ContentBlock(text=text, kind=kind, location=location)
-            )
-
-        graphics = _extract_inline_graphics(paragraph, doc, f"paragraph {idx}")
-        for item in graphics:
-            item.location = location
-        parsed.unsupported_items.extend(graphics)
-
-        if _has_ole_object(paragraph):
-            parsed.unsupported_items.append(
-                UnsupportedItem(
-                    kind=UnsupportedKind.EMBEDDED_OBJECT,
-                    location=location,
-                    note="OLE-embedded object - no extraction path in current scope",
-                    extraction_status=ExtractionStatus.NOT_APPLICABLE,
-                )
-            )
-
-    for table_idx, table in enumerate(doc.tables):
-        for row_idx, row in enumerate(table.rows):
-            for col_idx, cell in enumerate(row.cells):
-                cell_location = Location(
-                    table_index=table_idx,
-                    row_index=row_idx,
-                    column_index=col_idx,
-                )
-
-                for cell_paragraph in cell.paragraphs:
-                    cell_text = cell_paragraph.text.strip()
-                    if cell_text:
-                        parsed.blocks.append(
-                            ContentBlock(
-                                text=cell_text,
-                                kind=ContentKind.TABLE_CELL,
-                                location=cell_location,
-                            )
-                        )
-
-                    # Real gap, now fixed: table cells can contain
-                    # images/charts/SmartArt just like body paragraphs
-                    # can - doc.tables only exposed cell.text
-                    # previously, silently dropping any graphic
-                    # embedded inside a cell.
-                    graphics = _extract_inline_graphics(
-                        cell_paragraph,
-                        doc,
-                        f"table {table_idx} cell ({row_idx},{col_idx})",
-                    )
-                    for item in graphics:
-                        item.location = cell_location
-                    parsed.unsupported_items.extend(graphics)
-
-                    # Second real gap, now fixed: OLE detection was
-                    # only ever called on body paragraphs - an OLE
-                    # object (e.g. an embedded spreadsheet) inside a
-                    # table cell was silently missed entirely, same
-                    # class of asymmetric bug as the graphics gap
-                    # above, confirmed by inspection.
-                    if _has_ole_object(cell_paragraph):
-                        parsed.unsupported_items.append(
-                            UnsupportedItem(
-                                kind=UnsupportedKind.EMBEDDED_OBJECT,
-                                location=cell_location,
-                                note="OLE-embedded object - no extraction path in current scope",
-                                extraction_status=ExtractionStatus.NOT_APPLICABLE,
-                            )
-                        )
+            _process_paragraph(item, location, doc, parsed, kind)
+        else:
+            _process_table(item, doc, parsed, table_counter)
 
     logger.info(
         "Parsed %s: %d text blocks, %d unsupported items (%.0f chars)",
