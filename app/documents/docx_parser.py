@@ -32,6 +32,23 @@ the file. Revisit if review coverage for these sections becomes a
 real requirement - each is a genuinely separate python-docx access
 path (doc.sections[i].header/.footer, etc.), not a small extension
 of the current paragraph walk.
+
+ALSO EXPLICITLY OUT OF SCOPE, confirmed by direct test: text marked
+as a tracked-change DELETION (w:del/w:delText) is excluded from
+paragraph.text - confirmed by injecting a real w:del element and
+observing it does not appear in the parsed text. A document with
+unaccepted deletions will not have that deleted text reviewed, and
+it is not flagged as unsupported either (it's simply invisible to
+python-docx's own .text property, the same as headers/footers).
+Revisit only if reviewing tracked-change content becomes a real
+requirement - would need direct XML inspection for w:ins/w:del,
+not something paragraph.text can be coaxed into providing.
+
+KNOWN SIMPLIFICATION: table column_index is a cell ordinal from
+enumerate(row.cells), not a true grid position - merged/spanned
+cells can make the reported column_index inaccurate relative to the
+visual grid. Acceptable for MVP; a finding's presence and row are
+still correct, only exact column alignment under merges may drift.
 """
 
 from __future__ import annotations
@@ -92,10 +109,19 @@ def _is_heading(paragraph: Paragraph) -> bool:
 def _extract_picture(
     graphic_el,
     doc: DocxDocument,
-    paragraph_index: int,
+    location_for_log: str,
 ) -> UnsupportedItem:
     """Resolves an inline PICTURE to its raw bytes via the document
     part's relationship map.
+
+    location_for_log is a plain display string for log messages ONLY
+    (e.g. "paragraph 3" or "table 0 cell (0,1)") - NOT used to build
+    the actual UnsupportedItem's Location, which the caller sets
+    correctly afterward. Previously this parameter was a bare int
+    always labeled "paragraph %d" in log messages, so a warning about
+    a table-cell picture would misleadingly print "paragraph 3" when
+    the real location was table 3 - correct final data, wrong
+    diagnostics, confirmed by inspection.
 
     Confirmed API (python-docx 1.2.0): doc.part.related_parts is a
     dict keyed by relationship id -> Part. There is no
@@ -115,7 +141,8 @@ def _extract_picture(
       parse would crash on a real, common case (e.g. a pasted Excel
       chart or Visio object saved as EMF). Falls back to the part's
       raw .blob (bytes without python-docx's own format parsing/
-      validation) rather than crash.
+      validation) - confirmed correct attribute name by inspecting
+      opc.part.Part.blob's actual source, not just reasoned about.
     """
 
     # Navigate via raw XML find(), NOT the .graphic convenience
@@ -128,13 +155,13 @@ def _extract_picture(
 
     if blip is None:
         logger.warning(
-            "Graphic in paragraph %d has no blip element - flagging "
-            "without extraction",
-            paragraph_index,
+            "Graphic at %s has no blip element - flagging without "
+            "extraction",
+            location_for_log,
         )
         return UnsupportedItem(
             kind=UnsupportedKind.IMAGE,
-            location=Location(paragraph_index=paragraph_index),
+            location=Location(),  # caller overwrites
             note="unparseable inline picture structure",
             extraction_status=ExtractionStatus.FAILED,
         )
@@ -146,18 +173,18 @@ def _extract_picture(
         if link_r_id is not None:
             return UnsupportedItem(
                 kind=UnsupportedKind.IMAGE,
-                location=Location(paragraph_index=paragraph_index),
+                location=Location(),  # caller overwrites
                 note="linked (not embedded) image - no local bytes to extract",
                 extraction_status=ExtractionStatus.NOT_APPLICABLE,
             )
         logger.warning(
-            "Inline picture in paragraph %d has neither r:embed nor "
-            "r:link - flagging without extraction",
-            paragraph_index,
+            "Inline picture at %s has neither r:embed nor r:link - "
+            "flagging without extraction",
+            location_for_log,
         )
         return UnsupportedItem(
             kind=UnsupportedKind.IMAGE,
-            location=Location(paragraph_index=paragraph_index),
+            location=Location(),  # caller overwrites
             note="unparseable inline picture structure",
             extraction_status=ExtractionStatus.FAILED,
         )
@@ -166,13 +193,13 @@ def _extract_picture(
 
     if image_part is None:
         logger.warning(
-            "Could not resolve part for rId=%s in paragraph %d",
+            "Could not resolve part for rId=%s at %s",
             r_id,
-            paragraph_index,
+            location_for_log,
         )
         return UnsupportedItem(
             kind=UnsupportedKind.IMAGE,
-            location=Location(paragraph_index=paragraph_index),
+            location=Location(),  # caller overwrites
             note=f"could not resolve part for rId={r_id}",
             extraction_status=ExtractionStatus.FAILED,
         )
@@ -188,18 +215,20 @@ def _extract_picture(
         # python-docx's own image-format parsing failed (EMF/WMF and
         # similar are common real-world triggers) - fall back to the
         # part's raw bytes, which exist regardless of whether python-
-        # docx can parse the format's header.
+        # docx can parse the format's header. content_type is a plain
+        # always-present attribute on a Part (confirmed via source),
+        # so no getattr guard needed here.
         logger.info(
-            "Image in paragraph %d is in a format python-docx can't "
-            "parse (likely EMF/WMF) - using raw part bytes instead",
-            paragraph_index,
+            "Image at %s is in a format python-docx can't parse "
+            "(likely EMF/WMF) - using raw part bytes instead",
+            location_for_log,
         )
         raw_bytes = image_part.blob
-        content_type = getattr(image_part, "content_type", "unknown")
+        content_type = image_part.content_type
 
     return UnsupportedItem(
         kind=UnsupportedKind.IMAGE,
-        location=Location(paragraph_index=paragraph_index),
+        location=Location(),  # caller overwrites
         note=f"content_type={content_type}",
         raw_bytes=raw_bytes,
         extraction_status=ExtractionStatus.PENDING,
@@ -209,7 +238,7 @@ def _extract_picture(
 def _extract_inline_graphics(
     paragraph: Paragraph,
     doc: DocxDocument,
-    paragraph_index: int,
+    location_for_log: str,
 ) -> list[UnsupportedItem]:
     """Finds every graphic (picture, chart, or SmartArt) inside this
     paragraph - both INLINE (wp:inline, flows with text) and FLOATING/
@@ -219,6 +248,19 @@ def _extract_inline_graphics(
     text wrapping applied (a common real-world formatting choice, not
     an edge case) uses wp:anchor instead and was previously invisible
     to this parser entirely - not flagged, not extracted, just absent.
+
+    Returned items carry a PLACEHOLDER Location() - the caller (either
+    the body-paragraph loop or the table-cell loop in parse_docx)
+    always sets the real .location afterward. This is deliberate,
+    not an oversight: the previous version built the Location here
+    using a bare int meaning "paragraph index" in the body-paragraph
+    call site but was passed "table index" in the cell call site
+    (with the caller overwriting .location afterward regardless) -
+    correct final data, but any warning logged INSIDE this function
+    during the call would print "paragraph 3" for what was actually
+    table 3. Now nothing is built here that isn't immediately
+    overwritten, and location_for_log is a plain, honest display
+    string used ONLY for log messages.
 
     Charts/SmartArt in Word have no python-docx API support at all
     (confirmed: no docx.chart module exists), so - matching
@@ -231,18 +273,36 @@ def _extract_inline_graphics(
         f".//{_ANCHOR_TAG}"
     )
 
+    # Defensive dedup by embed rId: mc:AlternateContent wraps the
+    # same drawing in both mc:Choice and mc:Fallback for backward-
+    # compatibility with older Word versions - a real OOXML pattern
+    # real Word-authored documents can contain (not something python-
+    # docx itself generates, but something it can open). An unbounded
+    # `.//` search finds both copies, which would otherwise double-
+    # extract the same image and double-count its bytes/findings.
+    seen_r_ids: set[str] = set()
+
     for graphic_el in graphic_elements:
         graphic_data = graphic_el.find(f".//{_GRAPHIC_DATA_TAG}")
         uri = graphic_data.get("uri", "") if graphic_data is not None else ""
 
         if uri == _PICTURE_URI:
-            items.append(_extract_picture(graphic_el, doc, paragraph_index))
+            a_ns = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+            blip_el = graphic_el.find(f".//{a_ns}blip")
+            r_id = blip_el.get(qn("r:embed")) if blip_el is not None else None
+
+            if r_id is not None:
+                if r_id in seen_r_ids:
+                    continue  # AlternateContent duplicate - skip
+                seen_r_ids.add(r_id)
+
+            items.append(_extract_picture(graphic_el, doc, location_for_log))
 
         elif uri == _CHART_URI:
             items.append(
                 UnsupportedItem(
                     kind=UnsupportedKind.CHART,
-                    location=Location(paragraph_index=paragraph_index),
+                    location=Location(),  # caller overwrites
                     note=(
                         "chart data/visual layout not reviewed - "
                         "Word charts have no label-extraction path "
@@ -256,23 +316,47 @@ def _extract_inline_graphics(
             items.append(
                 UnsupportedItem(
                     kind=UnsupportedKind.SMARTART,
-                    location=Location(paragraph_index=paragraph_index),
+                    location=Location(),  # caller overwrites
                     note="SmartArt diagram - structure/content not reviewed in current scope",
                     extraction_status=ExtractionStatus.NOT_APPLICABLE,
                 )
             )
 
         else:
+            # NOTE: python-docx's own InlineShape.type classification
+            # uses this exact same URI-first check (confirmed by
+            # reading its source) and would ALSO return
+            # NOT_IMPLEMENTED for a wrapped graphic (e.g. Word Drawing
+            # Canvas / wordprocessingCanvas) whose graphicData uri
+            # isn't pic/chart/diagram even though a real pic:pic sits
+            # nested inside. This isn't a divergence from the
+            # library's own behavior - but probing for a nested blip
+            # anyway, beyond what the library itself does, costs
+            # little and can recover real image bytes the library's
+            # own classification would also miss.
+            a_ns = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+            nested_blip = graphic_el.find(f".//{a_ns}blip")
+            if nested_blip is not None and nested_blip.get(qn("r:embed")):
+                logger.info(
+                    "Graphic at %s has unrecognized graphicData "
+                    "uri=%r but contains a nested blip - attempting "
+                    "extraction anyway",
+                    location_for_log,
+                    uri,
+                )
+                items.append(_extract_picture(graphic_el, doc, location_for_log))
+                continue
+
             logger.warning(
-                "Graphic in paragraph %d has unrecognized graphicData "
-                "uri=%r - flagging as unsupported without extraction",
-                paragraph_index,
+                "Graphic at %s has unrecognized graphicData uri=%r "
+                "and no extractable blip - flagging as unsupported",
+                location_for_log,
                 uri,
             )
             items.append(
                 UnsupportedItem(
                     kind=UnsupportedKind.EMBEDDED_OBJECT,
-                    location=Location(paragraph_index=paragraph_index),
+                    location=Location(),  # caller overwrites
                     note=f"unrecognized graphic type (uri={uri or 'none'})",
                     extraction_status=ExtractionStatus.NOT_APPLICABLE,
                 )
@@ -303,6 +387,7 @@ def parse_docx(file_bytes: bytes, filename: str) -> ParsedDocument:
 
     for idx, paragraph in enumerate(doc.paragraphs):
         text = paragraph.text.strip()
+        location = Location(paragraph_index=idx)
 
         if text:
             kind = (
@@ -311,22 +396,19 @@ def parse_docx(file_bytes: bytes, filename: str) -> ParsedDocument:
                 else ContentKind.PARAGRAPH
             )
             parsed.blocks.append(
-                ContentBlock(
-                    text=text,
-                    kind=kind,
-                    location=Location(paragraph_index=idx),
-                )
+                ContentBlock(text=text, kind=kind, location=location)
             )
 
-        parsed.unsupported_items.extend(
-            _extract_inline_graphics(paragraph, doc, idx)
-        )
+        graphics = _extract_inline_graphics(paragraph, doc, f"paragraph {idx}")
+        for item in graphics:
+            item.location = location
+        parsed.unsupported_items.extend(graphics)
 
         if _has_ole_object(paragraph):
             parsed.unsupported_items.append(
                 UnsupportedItem(
                     kind=UnsupportedKind.EMBEDDED_OBJECT,
-                    location=Location(paragraph_index=idx),
+                    location=location,
                     note="OLE-embedded object - no extraction path in current scope",
                     extraction_status=ExtractionStatus.NOT_APPLICABLE,
                 )
@@ -358,11 +440,29 @@ def parse_docx(file_bytes: bytes, filename: str) -> ParsedDocument:
                     # previously, silently dropping any graphic
                     # embedded inside a cell.
                     graphics = _extract_inline_graphics(
-                        cell_paragraph, doc, table_idx
+                        cell_paragraph,
+                        doc,
+                        f"table {table_idx} cell ({row_idx},{col_idx})",
                     )
                     for item in graphics:
                         item.location = cell_location
                     parsed.unsupported_items.extend(graphics)
+
+                    # Second real gap, now fixed: OLE detection was
+                    # only ever called on body paragraphs - an OLE
+                    # object (e.g. an embedded spreadsheet) inside a
+                    # table cell was silently missed entirely, same
+                    # class of asymmetric bug as the graphics gap
+                    # above, confirmed by inspection.
+                    if _has_ole_object(cell_paragraph):
+                        parsed.unsupported_items.append(
+                            UnsupportedItem(
+                                kind=UnsupportedKind.EMBEDDED_OBJECT,
+                                location=cell_location,
+                                note="OLE-embedded object - no extraction path in current scope",
+                                extraction_status=ExtractionStatus.NOT_APPLICABLE,
+                            )
+                        )
 
     logger.info(
         "Parsed %s: %d text blocks, %d unsupported items (%.0f chars)",

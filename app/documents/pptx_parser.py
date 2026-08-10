@@ -74,7 +74,19 @@ def _is_smartart(shape: BaseShape) -> bool:
     shapes scale. python-pptx doesn't expose a has_smartart flag, so
     the underlying XML still has to be checked directly - see module
     docstring re: unverified-by-fixture status for the diagram-uri
-    match itself."""
+    match itself.
+
+    ORDERING NOTE, confirmed deliberate, not accidental: this runs
+    BEFORE the has_chart/has_table checks in _process_shape. A
+    populated table/chart placeholder is a GraphicFrame subclass too
+    (PlaceholderGraphicFrame), so it also passes the isinstance()
+    gate here - but a chart's graphicData uri is the chart namespace
+    and a table's is the table namespace, neither of which collides
+    with the diagram namespace checked below. So this function
+    correctly returns False for populated chart/table placeholders
+    and control correctly falls through to the has_chart/has_table
+    checks. Do not reorder without re-verifying this non-collision
+    still holds."""
 
     if not isinstance(shape, GraphicFrame):
         return False
@@ -100,18 +112,18 @@ def _extract_chart_labels(shape: BaseShape, location: Location) -> list[ContentB
     blocks: list[ContentBlock] = []
     chart = shape.chart
 
-    if chart.has_title:
-        title_text = chart.chart_title.text_frame.text.strip()
-        if title_text:
-            blocks.append(
-                ContentBlock(
-                    text=title_text,
-                    kind=ContentKind.CHART_LABEL,
-                    location=location,
-                )
-            )
-
     try:
+        if chart.has_title:
+            title_text = chart.chart_title.text_frame.text.strip()
+            if title_text:
+                blocks.append(
+                    ContentBlock(
+                        text=title_text,
+                        kind=ContentKind.CHART_LABEL,
+                        location=location,
+                    )
+                )
+
         for series in chart.series:
             if series.name and series.name.strip():
                 blocks.append(
@@ -132,8 +144,11 @@ def _extract_chart_labels(shape: BaseShape, location: Location) -> list[ContentB
                     )
                 )
     except (IndexError, AttributeError):
+        # Covers title extraction too now, not just series/categories -
+        # a malformed chart_title.text_frame previously raised
+        # uncaught since only the series/category block was guarded.
         logger.warning(
-            "Could not read series/category labels for chart at %s",
+            "Could not read title/series/category labels for chart at %s",
             location.display(),
             exc_info=True,
         )
@@ -188,6 +203,15 @@ def _process_shape(
         table_counter[0] += 1
         for row_idx, row in enumerate(shape.table.rows):
             for col_idx, cell in enumerate(row.cells):
+                if cell.is_spanned:
+                    # Explicit skip, not relying on empty-text
+                    # filtering as an implicit side effect - confirmed
+                    # by testing that a spanned cell's .text is
+                    # already empty (python-pptx does not duplicate
+                    # the merged-origin cell's text into spanned grid
+                    # positions), but making this deliberate rather
+                    # than incidental.
+                    continue
                 cell_text = cell.text.strip()
                 if cell_text:
                     parsed.blocks.append(
