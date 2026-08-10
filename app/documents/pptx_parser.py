@@ -9,13 +9,17 @@ PP_PLACEHOLDER.TITLE, image bytes via shape.image.blob, chart labels
 via chart.chart_title / chart.series / chart.plots[0].categories -
 all verified against a generated fixture, not assumed).
 
-SMARTART DETECTION IS UNVERIFIED BY FIXTURE TEST: python-pptx has no
-API to CREATE SmartArt diagrams, so no fixture could be built to
-prove the detection path works end-to-end. Implemented per the
-documented OOXML namespace for diagrams
+SMARTART DETECTION IS UNVERIFIED BY FIXTURE TEST, STILL: python-pptx
+has no API to CREATE SmartArt diagrams, so no fixture could be built
+to prove the detection path works end-to-end - this remains true
+across every review round so far. Implemented per the documented
+OOXML namespace for diagrams
 (http://schemas.openxmlformats.org/drawingml/2006/diagram) - this
 MUST be confirmed against a real SmartArt-containing deck during the
-large-file spike before being trusted in production.
+large-file spike before being trusted in production. The confident
+tone of _is_smartart's ordering-safety docstring applies ONLY to the
+ordering logic (which IS verified) - it does not mean the diagram-
+uri match itself has been proven against a real file.
 
 GROUPED SHAPES: recursed into (a group can contain pictures/tables/
 text), one level of real-world complexity handled; deeply nested
@@ -33,8 +37,9 @@ from typing import Any
 
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
+from pptx.media import SPEAKER_IMAGE_BYTES
 from pptx.shapes.graphfrm import GraphicFrame
-from pptx.shapes.picture import Movie, Picture
+from pptx.shapes.picture import Picture
 
 # python-pptx's shape base class (pptx.shapes.base.BaseShape) is not
 # re-exported from pptx.shapes' top level in 1.0.2 - confirmed by
@@ -305,23 +310,37 @@ def _process_shape(
         # check above, and correctly wasn't silently dropped either
         # (it would have reached the safety net below). But it WAS
         # being mislabeled as generic EMBEDDED_OBJECT, discarding a
-        # movie's poster frame - a real, extractable image (confirmed
-        # via Movie.poster_frame's actual source) - along the way.
-        # This branch classifies media correctly and recovers that
-        # poster-frame image for review like any other picture.
-        # Covers both video (has a poster frame, usually) and audio
-        # (PP_MEDIA_TYPE.SOUND also reports shape_type MEDIA, has no
-        # poster frame - handled by the None check below).
+        # real, extractable poster-frame image along the way.
+        #
+        # NOT distinguishing audio vs. video via shape.media_type:
+        # confirmed by reading the source that Movie.media_type is
+        # HARDCODED to unconditionally return PP_MEDIA_TYPE.MOVIE
+        # regardless of the underlying media - it cannot tell audio
+        # from video, so gating on it would be a no-op. Instead,
+        # comparing the extracted poster_frame bytes directly against
+        # pptx.media.SPEAKER_IMAGE_BYTES - confirmed this is literally
+        # the exact fallback python-pptx's own add_movie() uses when
+        # no real poster frame was supplied (audio clips very commonly
+        # hit this path). If it matches, this is a generic stock icon,
+        # not real reviewable content - flagged as such rather than
+        # sent through vision extraction as if it were meaningful.
         poster_frame = getattr(shape, "poster_frame", None)
-        if poster_frame is not None:
+
+        if poster_frame is not None and poster_frame.blob == SPEAKER_IMAGE_BYTES:
+            parsed.unsupported_items.append(
+                UnsupportedItem(
+                    kind=UnsupportedKind.EMBEDDED_OBJECT,
+                    location=location,
+                    note="media (audio/video) - generic placeholder icon only, no real poster frame to review",
+                    extraction_status=ExtractionStatus.NOT_APPLICABLE,
+                )
+            )
+        elif poster_frame is not None:
             parsed.unsupported_items.append(
                 UnsupportedItem(
                     kind=UnsupportedKind.IMAGE,
                     location=location,
-                    note=(
-                        f"video poster frame, content_type="
-                        f"{poster_frame.content_type}"
-                    ),
+                    note=f"media poster frame, content_type={poster_frame.content_type}",
                     raw_bytes=poster_frame.blob,
                     extraction_status=ExtractionStatus.PENDING,
                 )
@@ -331,7 +350,7 @@ def _process_shape(
                 UnsupportedItem(
                     kind=UnsupportedKind.EMBEDDED_OBJECT,
                     location=location,
-                    note="media (video/audio) - no poster frame available",
+                    note="media (audio/video) - no poster frame available",
                     extraction_status=ExtractionStatus.NOT_APPLICABLE,
                 )
             )

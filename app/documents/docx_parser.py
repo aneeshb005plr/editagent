@@ -52,10 +52,12 @@ requirement - would need direct XML inspection for w:ins/w:del,
 not something paragraph.text can be coaxed into providing.
 
 KNOWN SIMPLIFICATION: table column_index is a cell ordinal from
-enumerate(row.cells), not a true grid position - merged/spanned
-cells can make the reported column_index inaccurate relative to the
-visual grid. Acceptable for MVP; a finding's presence and row are
-still correct, only exact column alignment under merges may drift.
+enumerate(row.cells), not a true grid position - it can be shifted
+by TWO distinct causes: merged cells (handled via _tc-identity dedup,
+see _process_table) and Word's grid_cols_before/grid_cols_after,
+which let a row start late or end early (omitted leading cells shift
+every subsequent ordinal). Acceptable for MVP; a finding's presence
+and row are still correct, only exact column alignment may drift.
 """
 
 from __future__ import annotations
@@ -430,17 +432,40 @@ def _process_table(
     unsupported item, silently absent. table_counter is shared and
     incremented for every table encountered at ANY nesting level, so
     nested tables get their own distinct table_index rather than
-    colliding with their parent's."""
+    colliding with their parent's.
+
+    DEDUP BY cell._tc IDENTITY, required: row.cells repeats the SAME
+    underlying <w:tc> element once for every layout-grid position a
+    merged cell spans - confirmed by direct test, a 3-column merge
+    yields 3 cells from row.cells that are literally the same object
+    (identical cell._tc identity, identical text). Without this
+    dedup, a merged cell's text gets triple-counted, any image/OLE
+    inside it gets re-extracted and double/triple-counted (undoing
+    the seen_r_ids dedup one level up), and any nested table inside
+    it gets re-walked multiple times with table_counter incrementing
+    each time - this is real content/finding duplication, not a
+    cosmetic issue, and is worse than the pre-refactor code because
+    now it duplicates images/OLE/nested-subtrees, not just text."""
 
     this_table_index = table_counter[0]
     table_counter[0] += 1
+    seen_tcs = set()
 
     for row_idx, row in enumerate(table.rows):
         for col_idx, cell in enumerate(row.cells):
+            if cell._tc in seen_tcs:
+                continue  # merged-cell repeat - already processed
+            seen_tcs.add(cell._tc)
+
             cell_location = Location(
                 table_index=this_table_index,
                 row_index=row_idx,
                 column_index=col_idx,
+                # NOTE: col_idx is a cell ordinal from enumerate(),
+                # which can also be shifted by Word's grid_cols_before/
+                # grid_cols_after (rows starting late / ending early) -
+                # not just by merges. See module docstring's existing
+                # column_index caveat, which now covers both causes.
             )
 
             for cell_item in cell.iter_inner_content():
