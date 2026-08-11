@@ -35,14 +35,26 @@ documentation - see conversation history for the raw XML inspected.
 This adds one more read of the zip container but never loads cell
 data non-read-only, so the 100MB memory profile for cell scanning is
 unaffected.
+
+EXPLICITLY OUT OF SCOPE, not silently missing:
+- Chartsheets (a whole worksheet that IS a chart, a distinct OOXML
+  part type from a normal worksheet) are not covered -
+  _sheet_name_to_xml_path only resolves relationships of type
+  "worksheet", so a chart living in a chartsheet is never flagged.
+- Cell comments/notes (stored in a separate CommentSheet part) are
+  not read at all, even though they can contain reviewable prose -
+  the read-only cell-scanning pass never touches this part.
+- Linked (not embedded) images are detected (via TargetMode=
+  "External") and flagged as NOT_APPLICABLE, but their content is
+  never fetched - there's no local media to read.
 """
 
 from __future__ import annotations
 
 import io
 import logging
+import mimetypes
 import zipfile
-from dataclasses import dataclass
 
 import openpyxl
 from lxml import etree
@@ -71,13 +83,6 @@ _REL_TYPE_DRAWING = "http://schemas.openxmlformats.org/officeDocument/2006/relat
 _REL_TYPE_WORKSHEET = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
 
 
-@dataclass
-class _DrawingRef:
-    r_id: str
-    kind: UnsupportedKind  # IMAGE or CHART
-    target_path: str | None  # zip-internal path, only for images
-
-
 def _parse_rels(zf: zipfile.ZipFile, rels_path: str) -> dict[str, tuple[str, str]]:
     """Returns {r_id: (rel_type, resolved_target_path)} for a given
     .rels part, or {} if that part doesn't exist (e.g. a sheet with
@@ -94,11 +99,28 @@ def _parse_rels(zf: zipfile.ZipFile, rels_path: str) -> dict[str, tuple[str, str
         r_id = rel.get("Id")
         rel_type = rel.get("Type")
         target = rel.get("Target")
+        target_mode = rel.get("TargetMode")  # "External" for linked (non-embedded) media
+
+        if not target or not r_id:
+            # Malformed relationship entry - skip rather than crash
+            # the whole pass with an AttributeError on target.startswith()
+            # a few lines down.
+            continue
+
+        if target_mode == "External":
+            # A linked (not embedded) image/media reference - the
+            # Target is an external URI, not a path inside this zip,
+            # so there's nothing for zf.read() to resolve. Recorded
+            # with a synthetic marker rather than a real zip path;
+            # the caller checks for this explicitly.
+            result[r_id] = (rel_type, f"__EXTERNAL__:{target}")
+            continue
 
         if target.startswith("/"):
             resolved = target.lstrip("/")
         else:
             resolved = f"{base_dir}/{target}"
+            # Normalize any "../" segments.
             parts: list[str] = []
             for segment in resolved.split("/"):
                 if segment == "..":
@@ -200,14 +222,29 @@ def _extract_drawings_for_sheet(
             location = Location(sheet_name=sheet_name, cell_reference=cell_ref)
 
             if rel_type == _REL_TYPE_IMAGE:
-                try:
-                    raw_bytes = zf.read(target_path)
-                    ext = target_path.rsplit(".", 1)[-1].lower()
+                if target_path.startswith("__EXTERNAL__:"):
+                    # Linked (not embedded) image - real, if uncommon,
+                    # case: no local bytes exist to extract, confirmed
+                    # via the OOXML TargetMode="External" attribute.
                     items.append(
                         UnsupportedItem(
                             kind=UnsupportedKind.IMAGE,
                             location=location,
-                            note=f"content_type=image/{ext}",
+                            note="linked (not embedded) image - no local bytes to extract",
+                            extraction_status=ExtractionStatus.NOT_APPLICABLE,
+                        )
+                    )
+                    continue
+
+                try:
+                    raw_bytes = zf.read(target_path)
+                    guessed_type, _ = mimetypes.guess_type(target_path)
+                    content_type = guessed_type or f"image/{target_path.rsplit('.', 1)[-1].lower()}"
+                    items.append(
+                        UnsupportedItem(
+                            kind=UnsupportedKind.IMAGE,
+                            location=location,
+                            note=f"content_type={content_type}",
                             raw_bytes=raw_bytes,
                             extraction_status=ExtractionStatus.PENDING,
                         )
@@ -294,12 +331,28 @@ def parse_xlsx(file_bytes: bytes, filename: str) -> ParsedDocument:
                 if isinstance(cell, EmptyCell):
                     continue
 
-                if cell.data_type != "s":
+                if cell.data_type not in ("s", "inlineStr"):
                     # Formula ('f') or numeric ('n') - not reviewable
-                    # prose, skip per confirmed scope.
+                    # prose, skip per confirmed scope. Widened to also
+                    # accept 'inlineStr' defensively: confirmed by
+                    # reading openpyxl 3.1.5's actual parse_cell()
+                    # source that inlineStr is already remapped to
+                    # 's' in THIS version's read-only mode, so this
+                    # branch is currently unreachable for inlineStr -
+                    # kept as hardening against a future openpyxl
+                    # version regressing that behavior, not a fix for
+                    # an active bug in 3.1.5.
                     continue
 
-                text = (cell.value or "").strip()
+                raw = cell.value
+                # str(raw) rather than (cell.value or "") - confirmed
+                # CellRichText (openpyxl.cell.rich_text.CellRichText)
+                # is a list subclass with NO .strip() method; if a
+                # rich-text cell value were ever encountered despite
+                # the data_type=='s' filter, (cell.value or "").strip()
+                # would raise AttributeError. str(raw) degrades
+                # gracefully instead of crashing the whole parse.
+                text = str(raw).strip() if raw is not None else ""
                 if not text:
                     continue
 
