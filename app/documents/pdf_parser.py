@@ -30,6 +30,43 @@ still apply per-block regardless of kind); revisit only if findings
 need to distinguish "this was a heading" specifically for PDFs.
 
 NOT YET LOAD-TESTED AT 100MB.
+
+IMAGE DETECTION uses page.get_image_info(xrefs=True), NOT page.
+get_images() - confirmed via pymupdf maintainer guidance that
+get_images() reports images merely REFERENCED in a page's inherited
+/Resources dictionary, not necessarily images actually displayed on
+that specific page, which could cause false SCANNED_PAGE flags and
+duplicate/mislocated IMAGE items. get_image_info() reports only
+images with a real bounding box (i.e. actually rendered there).
+
+NOT DEDUPED ACROSS PAGES, deliberately: if the same physical image
+(e.g. a company logo) appears on many pages, each occurrence gets
+its own IMAGE item at its own page location - correct for accurate
+per-page findings, but means the same bytes get sent through vision
+extraction once per occurrence rather than once total. Real dedup
+(by xref or image_info's "digest" content hash) belongs in the
+extraction/orchestration layer that calls this parser, where it can
+be weighed against the batch's actual cost/latency budget, not
+hardcoded into the parser itself.
+
+EXPLICITLY OUT OF SCOPE, not silently missing:
+- Images inside annotation appearance streams (/AP) - stamps, seals,
+  some signatures - are invisible to get_image_info() the same way
+  they were to get_images(); no direct pymupdf API surfaces them.
+- Vector graphics/drawings (charts, diagrams, plots drawn with PDF
+  path commands rather than embedded raster images) are not
+  detected at all - pymupdf's page.get_drawings() could surface the
+  underlying paths, but reliably distinguishing "this is a
+  chart/diagram" from decorative lines or table borders is a hard,
+  unreliable heuristic problem, not attempted here. Same class of
+  gap as PDF charts flagged during broader chart/image scoping
+  discussion.
+- Font-broken text (bad ToUnicode mappings producing garbled but
+  technically non-empty extracted text) has no cheap, general
+  detection - such a page would pass the scanned-page check (text
+  exists) and get reviewed as garbage PAGE_TEXT with no flag. No
+  fix attempted; would need OCR as a fallback, which is the same
+  open scope question as scanned-page handling generally.
 """
 
 from __future__ import annotations
@@ -68,6 +105,32 @@ def parse_pdf(file_bytes: bytes, filename: str) -> ParsedDocument:
             page_number = page_index + 1  # 1-indexed for user-facing display
 
             text = page.get_text().strip()
+
+            # get_image_info(xrefs=True) reports images actually
+            # DISPLAYED on this specific page (each has a real bbox),
+            # NOT page.get_images() - which reports images merely
+            # REFERENCED in the page's /Resources dictionary. PDF
+            # pages can inherit a shared /Resources dict from an
+            # ancestor in the page tree, so get_images() can report
+            # the same image on every page that inherits the
+            # dictionary even when only one page actually shows it.
+            # This was a real correctness bug in the prior version,
+            # not just a documentation gap: it could falsely flag a
+            # genuinely blank page as SCANNED_PAGE, and could emit
+            # duplicate IMAGE items (with duplicate bytes) for a
+            # single physical image across multiple pages that merely
+            # reference it. Confirmed via pymupdf's own maintainer
+            # guidance and by checking get_image_info()'s real return
+            # shape (bbox/xref/digest per actual occurrence).
+            #
+            # NOTE: a `clip=pymupdf.INFINITE_RECT` parameter was
+            # considered (to catch images with off-page/negative-
+            # origin bounding boxes) but confirmed NOT to exist on
+            # get_image_info() in this installed version (1.28.2) -
+            # calling it raises TypeError. Omitted; off-page images
+            # are a known, accepted gap for now (see module docstring).
+            image_infos = page.get_image_info(xrefs=True)
+
             if text:
                 parsed.blocks.append(
                     ContentBlock(
@@ -76,11 +139,12 @@ def parse_pdf(file_bytes: bytes, filename: str) -> ParsedDocument:
                         location=Location(page_number=page_number),
                     )
                 )
-            elif page.get_images(full=True):
-                # No extractable text AND at least one image on the
-                # page - likely a scanned page. Flag distinctly from
-                # a normal embedded image so findings output can
-                # explain the difference to the user.
+            elif image_infos:
+                # No extractable text AND at least one image actually
+                # DISPLAYED on the page - likely a scanned page. Using
+                # image_infos (not the old get_images() check) means
+                # this no longer false-positives on a page that merely
+                # inherits an unused /Resources image reference.
                 parsed.unsupported_items.append(
                     UnsupportedItem(
                         kind=UnsupportedKind.SCANNED_PAGE,
@@ -95,8 +159,8 @@ def parse_pdf(file_bytes: bytes, filename: str) -> ParsedDocument:
                     )
                 )
 
-            for image_index, image_info in enumerate(page.get_images(full=True)):
-                xref = image_info[0]
+            for image_info in image_infos:
+                xref = image_info["xref"]
                 try:
                     extracted = doc.extract_image(xref)
                     parsed.unsupported_items.append(
