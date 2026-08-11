@@ -87,7 +87,6 @@ def run_lexical_rules(
 
     return findings
 
-
 def run_deterministic_rules(
     blocks: list[ContentBlock],
     rules: tuple[Rule, ...],
@@ -99,8 +98,6 @@ def run_deterministic_rules(
 
     findings: list[Finding] = []
 
-    # Pre-compile every pattern once, not per-block - real cost
-    # matters at 100MB scale with many blocks.
     compiled: list[tuple[Rule, re.Pattern]] = []
     for rule in rules:
         if not rule.pattern:
@@ -119,7 +116,18 @@ def run_deterministic_rules(
 
     for block in blocks:
         for rule, pattern in compiled:
-            matches = list(pattern.finditer(block.text))
+            matches = [
+                m for m in pattern.finditer(block.text)
+                if rule.match_validator is None or rule.match_validator(m)
+            ]
+            # FIXED REAL BUG, confirmed against a real audit RFP:
+            # numbers-range-should-use-en-dash flagged "858-677" (a
+            # phone-number-shaped fragment) as if it were a genuine
+            # numeric range - descending pairs are almost never real
+            # ranges. match_validator lets a rule reject specific
+            # regex matches via real logic (comparing the two
+            # numbers), not just pattern shape - see schema.py's
+            # Rule.match_validator docstring.
             if not matches:
                 continue
 

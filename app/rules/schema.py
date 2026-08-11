@@ -16,8 +16,10 @@ that boundary is where Pydantic validation would be added - not here.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Callable
 
 
 class RuleCategory(str, Enum):
@@ -112,6 +114,23 @@ class Rule:
     # --- Deterministic-only fields (None for judgment rules) ---
     pattern: str | None = None
     # A regex pattern, for DETERMINISTIC rules only.
+
+    match_validator: Callable[[re.Match], bool] | None = None
+    # OPTIONAL, DETERMINISTIC-only: a post-match filter for cases pure
+    # regex can't express - confirmed real need from production
+    # testing against a real audit RFP: numbers-range-should-use-
+    # en-dash's pattern (\d+-\d+) can't tell a genuine ascending range
+    # ("pages 15-22") from a phone-number-shaped fragment ("858-677",
+    # descending - real numbers ARE almost never expressed as a
+    # descending "range"). Regex can match the shape but can't compare
+    # the two numbers' magnitudes - that needs actual code. When set,
+    # a regex match is only kept if match_validator(match) returns
+    # True; when None (the default, true for nearly every rule), any
+    # regex match is accepted as before. Kept as a narrow escape
+    # hatch, not a general mechanism to lean on - most deterministic
+    # rules should stay pure pattern matching; reach for this only
+    # when a real false-positive pattern is confirmed, the same way
+    # this one was.
 
     # --- Judgment-only fields (empty for deterministic rules) ---
     trigger_terms: tuple[str, ...] = field(default_factory=tuple)
@@ -287,6 +306,12 @@ class RuleSet:
                         f"{r.rule_id}: LEXICAL rule should not set pattern "
                         f"(trigger_terms IS the match logic for lexical rules)"
                     )
+                if r.match_validator is not None:
+                    errors.append(
+                        f"{r.rule_id}: LEXICAL rule should not set match_validator "
+                        f"(match_validator only applies to regex matches, which LEXICAL "
+                        f"rules don't use)"
+                    )
 
             elif r.detection_type == DetectionType.JUDGMENT:
                 if r.pattern:
@@ -294,6 +319,12 @@ class RuleSet:
                         f"{r.rule_id}: JUDGMENT rule should not set pattern "
                         f"(pattern is unused for judgment rules - if this rule is "
                         f"actually unconditional, it should be LEXICAL or DETERMINISTIC)"
+                    )
+                if r.match_validator is not None:
+                    errors.append(
+                        f"{r.rule_id}: JUDGMENT rule should not set match_validator "
+                        f"(match_validator only applies to regex matches, which JUDGMENT "
+                        f"rules don't use)"
                     )
 
         if errors:

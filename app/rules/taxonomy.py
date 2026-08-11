@@ -33,6 +33,7 @@ schema.py's Rule.source_reference docstring for the full reasoning).
 from __future__ import annotations
 
 from app.rules.schema import AppliesTo, DetectionType, EnglishVariant, Rule, RuleCategory, RuleSet
+from app.rules.validators import is_ascending_range
 
 _grammar_rules = (
     # --- From Grammatical Topics.docx (all judgment - these require
@@ -329,13 +330,20 @@ _deterministic_mechanical_rules = (
         example_after="risk and capital management",
         source_reference="Style Guide p.5 (Ampersand)",
     ),
-    Rule(
+   Rule(
         rule_id="numbers-range-should-use-en-dash",
         category=RuleCategory.NUMBERS_FORMATTING,
         detection_type=DetectionType.DETERMINISTIC,
         applies_to=AppliesTo.GENERAL,
         description="Use an en dash (–), not a hyphen (-), for numeric ranges, with no surrounding spaces.",
-        pattern=r"\b\d+\s*-\s*\d+\b",
+        pattern=r"\b(\d+)\s*-\s*(\d+)\b",
+        # Capture groups added (previously \b\d+\s*-\s*\d+\b with no
+        # groups) so match_validator can compare the two numbers -
+        # see is_ascending_range's docstring for why this matters:
+        # confirmed via real production testing that this rule
+        # flagged phone-number-shaped fragments ("858-677") as if
+        # they were genuine ranges.
+        match_validator=is_ascending_range,
         explanation="A hyphen instead of an en dash for a range is a common, easily-fixed style deviation.",
         example_before="pages 15-22",
         example_after="pages 15–22",
