@@ -367,7 +367,7 @@ _deterministic_mechanical_rules = (
         detection_type=DetectionType.DETERMINISTIC,
         applies_to=AppliesTo.GENERAL,
         description="Spell out any number that begins a sentence (though the construction should generally be avoided).",
-        pattern=r"(?:^|[.!?]\s+)\d+\b",
+        pattern=r"(?<=^)\d+\b|(?<=[.!?]\s)\d+\b",
         explanation="A sentence should not begin with a numeral.",
         example_before="5 people attended the meeting.",
         example_after="Five people attended the meeting.",
@@ -810,7 +810,14 @@ _risk_language_audit_specific = (
         # exact row is marked "Acceptable in PCS Trust Solutions
         # (audit) proposals" - no longer secondhand/unverified.
         trigger_terms=("advisor", "business advisor", "trusted advisor", "business insights", "business perspective"),
-        description="In audit proposals, these terms are inconsistent with PwC's role as independent auditor (EXCEPT in PCS/private-company audit proposals, where this is explicitly marked acceptable).",
+        description="In audit proposals, these terms are inconsistent with PwC's role as independent auditor.",
+        # PCS exception is resolved STRUCTURALLY (see pcs_exception=
+        # True above and RuleSet.for_applies_to_with_pcs()) - by the
+        # time the LLM ever sees this rule's description, is_pcs was
+        # already False, so a "(EXCEPT in PCS...)" parenthetical here
+        # would be pure noise/potential confusion, not useful context.
+        # Previously included this clause when the PCS filtering was
+        # not yet actually wired into the engine (see engine.py fix).
         alternative="auditor",
         explanation="Audit independence requires avoiding language suggesting an advisory relationship.",
         source_reference="Style Guide p.95 (Appendix B - Trust Solutions, PCS exception confirmed)",
@@ -880,7 +887,7 @@ _risk_language_audit_specific = (
         # exact row is marked "Acceptable in PCS Trust Solutions
         # (audit) proposals" - no longer secondhand/unverified.
         trigger_terms=("collaborate", "collaborative"),
-        description="In audit proposals, 'collaborate' should refer only to PwC teams working with each other, NOT collaboration with the audit client (EXCEPT in PCS proposals, where this is explicitly marked acceptable).",
+        description="In audit proposals, 'collaborate' should refer only to PwC teams working with each other, NOT collaboration with the audit client",
         alternative="work concurrently with (for client-facing use)",
         source_reference="Style Guide p.96 (Appendix B - Trust Solutions, PCS exception confirmed)",
     ),

@@ -28,17 +28,54 @@ async def review_document(
     applies_to: AppliesTo,
     judgment_model: Runnable,
     english_variant: EnglishVariant = EnglishVariant.US,
+    is_pcs: bool = False,
 ) -> list[Finding]:
-    """english_variant defaults to US. Passing GLOBAL requires the
-    caller to have actually asked the user at intake which variant
-    the document targets - nothing here infers it automatically."""
+    """Runs the full review pipeline against an already-parsed
+    document (see app.documents.pipeline.parse_and_extract - image
+    text should already be extracted into parsed.blocks before this
+    is called, so it gets reviewed like any other text).
 
-    applicable_rules = rule_set.for_applies_to(applies_to)
+    judgment_model is the SHARED, UNBOUND GenAI client (from
+    app.llm.get_genai_client) - both the judgment and consistency
+    passes apply their own with_structured_output() on top of it
+    independently.
+
+    applies_to determines which rule subset runs - GENERAL always;
+    GENERAL+AUDIT only when the document was confirmed as an audit/
+    assurance proposal at intake.
+
+    is_pcs: FIXED REAL BUG - this parameter did not exist until now,
+    meaning the entire PCS (Private Company Services) carve-out
+    built into the taxonomy (pcs_exception field, RuleSet.
+    for_applies_to_with_pcs()) was fully implemented but completely
+    unreachable - a PCS audit proposal would have been false-
+    positived on "advisor"/"collaborate" with no way to suppress it.
+    Confirmed by direct code inspection before this fix. Requires a
+    real intake follow-up question ("is this specifically a PCS/
+    private-company audit?") once the conversational shell exists -
+    this parameter is the wiring point for that answer.
+
+    english_variant defaults to US - matches the taxonomy's implicit
+    default (built from a US-oriented style guide). Passing GLOBAL
+    requires the caller to have actually asked the user at intake
+    which variant the document targets - nothing here infers it
+    automatically.
+    """
+
+    # FIXED REAL BUG: previously called rule_set.for_applies_to()
+    # directly and hand-rolled the english_variant filter inline,
+    # bypassing for_applies_to_with_pcs() and for_english_variant()
+    # entirely - meaning those two RuleSet methods were dead code and
+    # is_pcs had no effect anywhere (it didn't even exist as a
+    # parameter). Now actually uses both.
+    applicable_rules = rule_set.for_applies_to_with_pcs(applies_to, is_pcs)
+    variant_allowed_ids = {r.rule_id for r in rule_set.for_english_variant(english_variant)}
     applicable_rules = tuple(
-        r for r in applicable_rules
-        if r.english_variant is None or r.english_variant == english_variant
+        r for r in applicable_rules if r.rule_id in variant_allowed_ids
     )
 
+    # CONSISTENCY-category rules need the whole document, not one
+    # block at a time - routed to a structurally separate pass.
     consistency_rules = tuple(
         r for r in applicable_rules if r.category == RuleCategory.CONSISTENCY
     )
@@ -59,8 +96,13 @@ async def review_document(
     logger.info(
         "Reviewing %s: %d blocks, applies_to=%s (%d deterministic, %d lexical, "
         "%d judgment, %d consistency rules active)",
-        parsed.source_filename, len(parsed.blocks), applies_to.value,
-        len(deterministic_rules), len(lexical_rules), len(judgment_rules), len(consistency_rules),
+        parsed.source_filename,
+        len(parsed.blocks),
+        applies_to.value,
+        len(deterministic_rules),
+        len(lexical_rules),
+        len(judgment_rules),
+        len(consistency_rules),
     )
 
     findings: list[Finding] = []
@@ -78,7 +120,8 @@ async def review_document(
 
     logger.info(
         "Review complete for %s: %d total findings",
-        parsed.source_filename, len(findings),
+        parsed.source_filename,
+        len(findings),
     )
 
     return findings

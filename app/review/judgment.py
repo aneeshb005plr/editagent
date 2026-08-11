@@ -2,16 +2,30 @@
 app/review/judgment.py
 
 Runs every JUDGMENT rule via batched, structured-output LLM calls.
+This is the expensive pass - real design effort goes into keeping
+it as cheap as possible without sacrificing the deterministic-first
+principle (see architecture doc Section 6).
 
-CANDIDATE SELECTION, per block: rules with trigger_terms are
-candidates only if a term appears (case-insensitive substring) in
-the block; rules with NO trigger_terms are candidates for every
-block (most grammar rules - no useful keyword pre-filter exists).
+CANDIDATE SELECTION, per block, before any LLM call:
+- Rules with trigger_terms: candidate only if a trigger term appears
+  (bounded match, see app.review.matching) in the block's text. This
+  does NOT decide whether the rule is actually violated - only
+  whether it's even worth asking the model about this block.
+- Rules with NO trigger_terms (most grammar rules - subject-verb
+  agreement can appear anywhere) are candidates for EVERY block.
+  This is intentional, not an inefficiency - and it's also why
+  narrowly over-broad trigger_terms on a FEW rules (e.g. "that"/
+  "which") isn't the dominant cost driver: most judgment rules
+  already bypass the pre-filter by design (confirmed: ~28 of ~40
+  judgment rules have no trigger_terms and fire on every block
+  regardless).
 
-BATCHING: blocks are grouped so multiple blocks go into ONE LLM call.
+BATCHING: blocks are grouped so multiple blocks' worth of candidate
+checks go into ONE LLM call with structured output, rather than one
+call per block or per rule.
 
-RESILIENCE: one batch failing is logged and skipped, not allowed to
-kill the whole review.
+RESILIENCE: one batch failing (timeout, malformed response) is
+logged and skipped, not allowed to kill the whole review.
 """
 
 from __future__ import annotations
@@ -21,12 +35,17 @@ import logging
 from langchain_core.runnables import Runnable
 
 from app.documents.base import ContentBlock
+from app.review.matching import term_matches
 from app.review.models import Finding, LLMJudgmentBatchResponse
 from app.rules.schema import Rule
 
 logger = logging.getLogger("app.review.judgment")
 
 _DEFAULT_BATCH_SIZE = 15
+# Blocks per LLM call - untuned default, same status as
+# image_extraction.py's max_concurrent guess. Needs real tuning once
+# cost/latency data exists against the actual GenAI endpoint and
+# actual document sizes.
 
 _SYSTEM_PROMPT = """You are reviewing excerpts from a PwC pursuit/proposal document \
 against a specific set of writing-quality and compliance rules. For each block below, \
@@ -41,14 +60,21 @@ def _select_candidate_rules(
     block_text: str,
     judgment_rules: tuple[Rule, ...],
 ) -> list[Rule]:
-    text_lower = block_text.lower()
     candidates: list[Rule] = []
 
     for rule in judgment_rules:
         if not rule.trigger_terms:
+            # No keyword pre-filter available - always a candidate.
             candidates.append(rule)
             continue
-        if any(term.lower() in text_lower for term in rule.trigger_terms):
+        # Fixed real bug: was naive substring matching, which
+        # candidate-matched "who" inside "whole", "less" inside
+        # "unless", "trust" inside "Trust Solutions" - confirmed by
+        # direct testing. term_matches() uses lookaround bounding
+        # instead of \b, since \b itself fails for symbol-starting/
+        # ending triggers (confirmed: "&" via \b doesn't match
+        # "risk & capital" at all).
+        if any(term_matches(term, block_text) for term in rule.trigger_terms):
             candidates.append(rule)
 
     return candidates
@@ -57,6 +83,9 @@ def _select_candidate_rules(
 def _build_batch_prompt(
     batch: list[tuple[str, ContentBlock, list[Rule]]],
 ) -> str:
+    """batch is [(block_id, block, candidate_rules), ...] - already
+    filtered to blocks that have at least one candidate rule."""
+
     sections = []
     for block_id, block, candidate_rules in batch:
         rule_lines = "\n".join(
@@ -79,6 +108,13 @@ async def run_judgment_rules(
     base_model: Runnable,
     batch_size: int = _DEFAULT_BATCH_SIZE,
 ) -> list[Finding]:
+    """rules should already be filtered to JUDGMENT-only and to the
+    applicable AppliesTo set (caller's responsibility, same as
+    run_deterministic_rules). base_model is the shared, UNBOUND GenAI
+    client (app.llm.get_genai_client) - with_structured_output() is
+    applied here, not passed in pre-bound, since this module owns the
+    specific response schema it needs."""
+
     structured_model = base_model.with_structured_output(LLMJudgmentBatchResponse)
 
     prepared: list[tuple[str, ContentBlock, list[Rule]]] = []
@@ -109,14 +145,19 @@ async def run_judgment_rules(
             logger.error(
                 "Judgment batch %d/%d failed (%d blocks) - skipping this batch, "
                 "continuing with the rest of the review",
-                batch_num + 1, len(batches), len(batch), exc_info=True,
+                batch_num + 1,
+                len(batches),
+                len(batch),
+                exc_info=True,
             )
             continue
 
         if not isinstance(response, LLMJudgmentBatchResponse):
             logger.warning(
                 "Judgment batch %d/%d returned unexpected type %s - skipping",
-                batch_num + 1, len(batches), type(response),
+                batch_num + 1,
+                len(batches),
+                type(response),
             )
             continue
 
@@ -128,7 +169,8 @@ async def run_judgment_rules(
                 logger.warning(
                     "Judgment finding referenced unknown block_id=%r or "
                     "rule_id=%r - dropping this finding",
-                    item.block_id, item.rule_id,
+                    item.block_id,
+                    item.rule_id,
                 )
                 continue
 
@@ -147,7 +189,9 @@ async def run_judgment_rules(
 
     logger.info(
         "Judgment pass: %d batches, %d blocks with candidates -> %d findings",
-        len(batches), len(prepared), len(findings),
+        len(batches),
+        len(prepared),
+        len(findings),
     )
 
     return findings
