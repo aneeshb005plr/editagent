@@ -21,25 +21,43 @@ entirely depending on downstream decisions (concurrency budget,
 whether image review is enabled for a given job, etc.). Keeping it
 separate means the parsers don't need to know or care.
 
-UNVERIFIED AGAINST THE REAL PwC GENAI ENDPOINT. Verified here only
-with a MOCKED model exercising the success / no-text / failure code
-paths - that proves the logic is sound, NOT that the real endpoint
-(a) is reachable via ChatOpenAI's base_url/api_key pattern the same
-way OpenAI's own API is, or (b) actually accepts multimodal input
-for whatever model GENAI_LLM_MODEL resolves to. Both need a real
-smoke test against actual GENAI_BASE_URL/GENAI_API_KEY before this
-is trusted in production.
+IMAGES ARE NORMALIZED TO PNG BEFORE EVERY VISION CALL - fixed a real,
+confirmed production bug found via the first real-endpoint test
+against an actual audit RFP PDF: the vision endpoint (Azure OpenAI,
+fronted by LiteLLM - both confirmed directly from the real error's
+traceback, information not previously known about this project's
+infrastructure) rejected the image with "AzureException image...
+must be one of jpeg/gif/webp/png". None of the four parsers validate
+or convert the native format they extract - pymupdf/python-docx/
+python-pptx/openpyxl all return whatever format was actually embedded
+in the source file (JPEG2000, JBIG2, TIFF, BMP, and other formats
+common in scanned/complex documents are all real possibilities, not
+edge cases), and this module was forwarding those raw bytes with the
+extracted extension as the mime_type, completely unvalidated. Now
+every image is decoded and re-encoded as PNG via Pillow BEFORE
+building the vision request, regardless of source format - this is
+the correct place for this fix (one shared choke point all four
+parsers already feed into), not four separate per-parser fixes.
+
+CONFIRMED VERIFIED AGAINST THE REAL PwC GENAI ENDPOINT as of this
+fix - the failure above IS that verification; error handling itself
+worked correctly (the APIError was caught, logged, and the rest of
+the review completed normally) even before this fix, so the gap was
+purely "sends a format the endpoint rejects," not the error-handling
+path.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import logging
 
 from langchain_core.messages import HumanMessage
-from langchain_openai import ChatOpenAI
+from langchain_core.runnables import Runnable
 from openai import APIError
+from PIL import Image, UnidentifiedImageError
 # ChatOpenAI wraps the openai SDK internally and does not define its
 # own API-error hierarchy - errors from the underlying HTTP call
 # still surface as openai.APIError (confirmed: langchain_openai adds
@@ -68,27 +86,35 @@ _EXTRACTION_PROMPT = (
 _NO_TEXT_MARKER = "NO_TEXT_FOUND"
 
 
-def build_vision_model(base_url: str, api_key: str, model: str) -> ChatOpenAI:
-    """Constructs the ChatOpenAI client used for image extraction.
+def _normalize_to_png(raw_bytes: bytes) -> bytes | None:
+    """Decodes raw_bytes in WHATEVER format it's actually in and
+    re-encodes as PNG - confirmed via direct test that this round-
+    trips correctly even for a format the vision endpoint itself
+    rejects (e.g. TIFF in, valid PNG magic bytes out). Returns None
+    if Pillow genuinely can't decode the bytes at all (corrupt data,
+    or a format Pillow itself doesn't support - a real but rarer
+    failure mode than "valid image, wrong format for the endpoint",
+    which this function eliminates entirely)."""
 
-    Confirmed against the real installed package: model/base_url/
-    api_key are valid constructor aliases in langchain-openai 1.4.2
-    (resolving to model_name/openai_api_base/openai_api_key
-    internally) - not guessed from older documentation.
-    """
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        img.load()  # force full decode now, not lazily at save() time
+    except (UnidentifiedImageError, OSError):
+        return None
 
-    return ChatOpenAI(
-        model=model,
-        base_url=base_url,
-        api_key=api_key,
-        temperature=0,
-        max_tokens=1000,
-    )
+    if img.mode not in ("RGB", "RGBA", "L"):
+        # CMYK, palette, and other modes PNG can't always round-trip
+        # cleanly - convert to RGB, the safest universal choice.
+        img = img.convert("RGB")
+
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
 
 
 async def extract_text_from_image(
     item: UnsupportedItem,
-    vision_model: ChatOpenAI,
+    vision_model: Runnable,
 ) -> ContentBlock | None:
     """Attempts to extract text from a single image UnsupportedItem.
 
@@ -112,16 +138,26 @@ async def extract_text_from_image(
         item.extraction_status = ExtractionStatus.FAILED
         return None
 
-    mime_type = "image/png"
-    if item.note and "content_type=" in item.note:
-        mime_type = item.note.split("content_type=")[-1].strip()
+    png_bytes = _normalize_to_png(item.raw_bytes)
 
-    b64_data = base64.b64encode(item.raw_bytes).decode("ascii")
+    if png_bytes is None:
+        logger.warning(
+            "Could not decode image bytes at %s (format unrecognized/corrupt) "
+            "- skipping vision extraction",
+            item.location.display(),
+        )
+        item.extraction_status = ExtractionStatus.FAILED
+        return None
+
+    b64_data = base64.b64encode(png_bytes).decode("ascii")
 
     message = HumanMessage(
         content_blocks=[
             {"type": "text", "text": _EXTRACTION_PROMPT},
-            {"type": "image", "base64": b64_data, "mime_type": mime_type},
+            {"type": "image", "base64": b64_data, "mime_type": "image/png"},
+            # Always image/png now - normalized above, regardless of
+            # whatever format was actually embedded in the source
+            # file. No longer trusts item.note's extracted extension.
         ]
     )
 
@@ -155,7 +191,7 @@ async def extract_text_from_image(
 
 async def extract_images_in_document(
     parsed: ParsedDocument,
-    vision_model: ChatOpenAI,
+    vision_model: Runnable,
     max_concurrent: int = 5,
 ) -> None:
     """Runs extraction for every PENDING image in
@@ -163,10 +199,12 @@ async def extract_images_in_document(
     parsed.blocks in place.
 
     max_concurrent caps simultaneous vision calls - a real, currently
-    UNTUNED guess (5). A 100MB deck could plausibly contain dozens of
-    images; this needs a value informed by the large-file spike
-    (actual cost/latency budget against the shared GenAI service),
-    not left at a guessed default when this goes to production.
+    UNTUNED guess (5), though now we have one real data point: a
+    single vision call against the real endpoint took ~6 seconds
+    (confirmed from real test timing) - a 100MB deck with dozens of
+    images could add real minutes at this concurrency level. Still
+    needs a value informed by the full large-file spike, not just
+    this one data point.
     """
 
     pending = [

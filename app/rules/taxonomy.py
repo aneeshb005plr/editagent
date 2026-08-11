@@ -253,7 +253,16 @@ _deterministic_mechanical_rules = (
         detection_type=DetectionType.DETERMINISTIC,
         applies_to=AppliesTo.GENERAL,
         description="Use one space, not two, after a period between sentences.",
-        pattern=r"\.\s{2,}[A-Z]",
+        pattern=r"(?<=\.)\s{2,}(?=[A-Z])",
+        # FIXED REAL BUG, confirmed from a real production test run
+        # against an actual audit RFP PDF: the original pattern
+        # r"\.\s{2,}[A-Z]" included the period AND the next sentence's
+        # first letter in the match itself, so original_text (shown
+        # to the user as "the offending text") came out as
+        # confusing fragments like ". \nO" instead of showing the
+        # actual issue (the extra whitespace). Lookaround asserts the
+        # surrounding context without capturing it - now the match is
+        # just the whitespace itself.
         explanation="Double spacing after periods is outdated typing convention, not current style.",
         source_reference="Style Guide p.25 (Periods)",
     ),
