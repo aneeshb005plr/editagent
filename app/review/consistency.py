@@ -1,23 +1,15 @@
 """
 app/review/consistency.py
 
-CONSISTENCY-category rules (terminology drift, capitalization drift
-across the document) cannot be answered by looking at one block at a
-time - "is this term capitalized the same way everywhere" is a
-whole-document question. This is a structurally different pass from
-deterministic/judgment, not a variant of either - see architecture
-doc Section 6 and the taxonomy fix that moved
-gram-capitalization-consistency out of a per-block category once
-this distinction became concrete while building the engine.
+CONSISTENCY-category rules need the whole document, not one block at
+a time - "is this term capitalized the same way everywhere" is a
+whole-document question, structurally different from deterministic/
+judgment.
 
-NOT YET CHUNKED/MAP-REDUCED FOR LARGE DOCUMENTS - this sends the
-full document's text in one call, same "not yet load-tested at
-100MB" caveat as every other unverified-at-scale piece of this
-build. A real large document will need this pass redesigned around
-extracting a compact representation (e.g. all distinct terms/
-capitalization variants found) rather than sending raw block text,
-before it can run affordably at 100MB scale. Flagged explicitly
-rather than silently assumed to scale.
+NOT YET CHUNKED/MAP-REDUCED FOR LARGE DOCUMENTS - sends the full
+document's text in one call. A real large document will need this
+pass redesigned around a compact extracted representation before it
+can run affordably at 100MB scale.
 """
 
 from __future__ import annotations
@@ -60,16 +52,6 @@ async def run_consistency_pass(
     base_model: Runnable,
     max_blocks: int = 200,
 ) -> list[Finding]:
-    """rules should already be filtered to CONSISTENCY category and
-    the applicable AppliesTo set (caller's responsibility).
-
-    max_blocks is a crude safety cap, not a real solution - see
-    module docstring on why this pass isn't yet suitable for a real
-    100MB document. Silently truncating past this cap rather than
-    failing is a deliberate short-term choice: a partial consistency
-    check on the first N blocks is more useful than none, but this
-    MUST be revisited before being trusted on large documents."""
-
     if not rules or not blocks:
         return []
 
@@ -78,8 +60,7 @@ async def run_consistency_pass(
         logger.warning(
             "Consistency pass: document has %d blocks, truncating to first %d - "
             "this pass is not yet designed for full-document scale, see module docstring",
-            len(blocks),
-            max_blocks,
+            len(blocks), max_blocks,
         )
 
     indexed = [(f"b{i}", block) for i, block in enumerate(working_blocks)]
@@ -111,8 +92,7 @@ async def run_consistency_pass(
         if block is None or rule is None:
             logger.warning(
                 "Consistency finding referenced unknown block_id=%r or rule_id=%r",
-                item.block_id,
-                item.rule_id,
+                item.block_id, item.rule_id,
             )
             continue
 
