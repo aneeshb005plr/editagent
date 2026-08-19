@@ -8,28 +8,64 @@ principle (see architecture doc Section 6).
 
 CANDIDATE SELECTION, per block, before any LLM call:
 - Rules with trigger_terms: candidate only if a trigger term appears
-  (bounded match, see app.review.matching) in the block's text. This
-  does NOT decide whether the rule is actually violated - only
-  whether it's even worth asking the model about this block.
+  (case-insensitive substring) in the block's text. This does NOT
+  decide whether the rule is actually violated - only whether it's
+  even worth asking the model about this block. A block containing
+  "ensure" is a CANDIDATE for the guarantee-language rule; whether
+  it's used in the restricted sense is still the model's call.
 - Rules with NO trigger_terms (most grammar rules - subject-verb
   agreement can appear anywhere) are candidates for EVERY block.
-  This is intentional, not an inefficiency - and it's also why
-  narrowly over-broad trigger_terms on a FEW rules (e.g. "that"/
-  "which") isn't the dominant cost driver: most judgment rules
-  already bypass the pre-filter by design (confirmed: ~28 of ~40
-  judgment rules have no trigger_terms and fire on every block
-  regardless).
+  This is intentional, not an inefficiency: grammar checks need to
+  run broadly, and there's no useful keyword pre-filter for them.
 
 BATCHING: blocks are grouped so multiple blocks' worth of candidate
 checks go into ONE LLM call with structured output, rather than one
-call per block or per rule.
+call per block or per rule - the latter would be prohibitively slow/
+expensive at 100MB scale (potentially thousands of blocks).
+
+BATCHES RUN CONCURRENTLY, bounded by a semaphore - FIXED A REAL,
+CONFIRMED PRODUCTION BUG: this previously processed batches in a
+strictly sequential for-loop (one full ainvoke() awaited before the
+next began). Confirmed via direct math against real production
+timing data (a single batch took ~30s on a real endpoint) that this
+fully explains a real reported incident: an 8MB PPTX (plausibly
+100-300+ text blocks once slide text, table cells, etc. are all
+counted) stuck "processing" for 15+ minutes - at batch_size=15,
+that's ~20 sequential batches, ~10 minutes for the judgment pass
+alone before adding image extraction and the consistency pass on
+top. Fixed via asyncio.Semaphore-bounded concurrent batches, matching
+the exact same pattern already used in image_extraction.py for
+images, and confirmed as current standard practice for concurrent
+LangChain/OpenAI-compatible calls (bounded asyncio.gather + Semaphore,
+not unbounded concurrency, to protect the shared GenAI service from
+a burst of simultaneous requests).
 
 RESILIENCE: one batch failing (timeout, malformed response) is
-logged and skipped, not allowed to kill the whole review.
+logged and skipped, not allowed to kill the whole review - same
+per-unit isolation principle as knowledge-sync-worker's per-agent
+try/except. This property is PRESERVED under concurrency - each
+batch's own try/except still isolates its own failure, and
+asyncio.gather collects every batch's result (or None on failure)
+regardless of which batches succeeded or failed.
+
+A SEPARATE, REAL RISK THIS FIX DOES NOT ADDRESS: langchain_openai's
+ChatOpenAI defaults to multiple retries with exponential backoff on
+a slow/flaky call - a single bad request can silently turn into a
+multi-minute "phantom wait" before it even fails, independent of
+this module's own concurrency. Confirmed as a documented real-world
+failure mode in production LangChain usage (not just theoretical).
+Whether app/llm.py's connect_genai() sets explicit `timeout`/
+`max_retries` on the shared ChatOpenAI client has NOT been confirmed
+by this agent (never seen that file's current content) - worth
+checking directly; scripts/test_review_pipeline.py's own standalone
+client construction sets timeout=60.0, max_retries=2 as a deliberate
+safety measure, but that's this agent's own test script, not
+necessarily what the real production client does.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from langchain_core.runnables import Runnable
@@ -46,6 +82,14 @@ _DEFAULT_BATCH_SIZE = 15
 # image_extraction.py's max_concurrent guess. Needs real tuning once
 # cost/latency data exists against the actual GenAI endpoint and
 # actual document sizes.
+
+_DEFAULT_MAX_CONCURRENT_BATCHES = 5
+# How many batches can be in flight to the GenAI service at once -
+# untuned default, same status as image_extraction.py's own
+# max_concurrent=5. Bounds concurrent LLM load rather than firing
+# every batch at once (unbounded concurrency risks overwhelming the
+# shared GenAI service - confirmed as the standard concern behind
+# every real concurrent-LLM-call pattern found via search).
 
 _SYSTEM_PROMPT = """You are reviewing excerpts from a PwC pursuit/proposal document \
 against a specific set of writing-quality and compliance rules. For each block below, \
@@ -102,11 +146,55 @@ def _build_batch_prompt(
     return "\n\n".join(sections)
 
 
+async def _run_one_batch(
+    structured_model: Runnable,
+    batch: list[tuple[str, ContentBlock, list[Rule]]],
+    batch_num: int,
+    total_batches: int,
+) -> LLMJudgmentBatchResponse | None:
+    """One batch's full call, isolated - returns None on any failure
+    (logged) rather than raising, so asyncio.gather's caller doesn't
+    need exception-handling logic beyond checking for None. Same
+    resilience contract as before the concurrency fix, just moved
+    into its own function so it can be scheduled independently."""
+
+    prompt = _build_batch_prompt(batch)
+    try:
+        response = await structured_model.ainvoke(
+            [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ]
+        )
+    except Exception:
+        logger.error(
+            "Judgment batch %d/%d failed (%d blocks) - skipping this batch, "
+            "continuing with the rest of the review",
+            batch_num + 1,
+            total_batches,
+            len(batch),
+            exc_info=True,
+        )
+        return None
+
+    if not isinstance(response, LLMJudgmentBatchResponse):
+        logger.warning(
+            "Judgment batch %d/%d returned unexpected type %s - skipping",
+            batch_num + 1,
+            total_batches,
+            type(response),
+        )
+        return None
+
+    return response
+
+
 async def run_judgment_rules(
     blocks: list[ContentBlock],
     rules: tuple[Rule, ...],
     base_model: Runnable,
     batch_size: int = _DEFAULT_BATCH_SIZE,
+    max_concurrent_batches: int = _DEFAULT_MAX_CONCURRENT_BATCHES,
 ) -> list[Finding]:
     """rules should already be filtered to JUDGMENT-only and to the
     applicable AppliesTo set (caller's responsibility, same as
@@ -117,6 +205,9 @@ async def run_judgment_rules(
 
     structured_model = base_model.with_structured_output(LLMJudgmentBatchResponse)
 
+    # Build (block_id, block, candidate_rules) for every block that
+    # has at least one candidate - skip blocks with none, nothing to
+    # send the LLM about.
     prepared: list[tuple[str, ContentBlock, list[Rule]]] = []
     for i, block in enumerate(blocks):
         candidates = _select_candidate_rules(block.text, rules)
@@ -129,36 +220,26 @@ async def run_judgment_rules(
     block_by_id = {block_id: block for block_id, block, _ in prepared}
     rule_by_id = {r.rule_id: r for r in rules}
 
-    findings: list[Finding] = []
     batches = [prepared[i : i + batch_size] for i in range(0, len(prepared), batch_size)]
 
-    for batch_num, batch in enumerate(batches):
-        prompt = _build_batch_prompt(batch)
-        try:
-            response = await structured_model.ainvoke(
-                [
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ]
-            )
-        except Exception:
-            logger.error(
-                "Judgment batch %d/%d failed (%d blocks) - skipping this batch, "
-                "continuing with the rest of the review",
-                batch_num + 1,
-                len(batches),
-                len(batch),
-                exc_info=True,
-            )
-            continue
+    semaphore = asyncio.Semaphore(max_concurrent_batches)
 
-        if not isinstance(response, LLMJudgmentBatchResponse):
-            logger.warning(
-                "Judgment batch %d/%d returned unexpected type %s - skipping",
-                batch_num + 1,
-                len(batches),
-                type(response),
-            )
+    async def _bounded_run(batch_num: int, batch: list) -> LLMJudgmentBatchResponse | None:
+        async with semaphore:
+            return await _run_one_batch(structured_model, batch, batch_num, len(batches))
+
+    # FIXED REAL BUG (see module docstring): previously a sequential
+    # for-loop, one full ainvoke() awaited before the next batch even
+    # started - confirmed via math against real timing data to fully
+    # explain a real reported 15+ minute stall on an 8MB document.
+    # Now runs up to max_concurrent_batches batches at once.
+    responses = await asyncio.gather(
+        *[_bounded_run(i, batch) for i, batch in enumerate(batches)]
+    )
+
+    findings: list[Finding] = []
+    for response in responses:
+        if response is None:
             continue
 
         for item in response.findings:
@@ -166,6 +247,9 @@ async def run_judgment_rules(
             rule = rule_by_id.get(item.rule_id)
 
             if block is None or rule is None:
+                # Model referenced a block_id/rule_id we never gave it
+                # - degrade gracefully (drop this one finding) rather
+                # than crash the whole batch's otherwise-valid results.
                 logger.warning(
                     "Judgment finding referenced unknown block_id=%r or "
                     "rule_id=%r - dropping this finding",
@@ -188,8 +272,9 @@ async def run_judgment_rules(
             )
 
     logger.info(
-        "Judgment pass: %d batches, %d blocks with candidates -> %d findings",
+        "Judgment pass: %d batches (max %d concurrent), %d blocks with candidates -> %d findings",
         len(batches),
+        max_concurrent_batches,
         len(prepared),
         len(findings),
     )
