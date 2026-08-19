@@ -186,6 +186,12 @@ class Settings(BaseSettings):
         # conversations that user has open - not a per-session limit.
     )
 
+    AUTH_MODE: str = "header"          # or "entra" — new
+    # (ENTRA_TENANT_ID, AUTH_DEV_BYPASS, IS_PRODUCTION already required by your real entra.py)
+    POLL_INTERVAL_SECONDS: int = 5
+    STALE_JOB_THRESHOLD_SECONDS: int = 900
+    MAX_CONCURRENT_JOBS: int = 3
+
     # ------------------------------------------------------------------
     # Authentication
     # ------------------------------------------------------------------

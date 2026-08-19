@@ -1,201 +1,202 @@
 # EditEdge — Production Architecture
 
-**Status:** Living document, updated as we build. Parsing layer (all four formats + image/chart extraction) is built and verified. Rules taxonomy is built and verified. Review engine is next. Channel integration, job infrastructure, and the conversational shell are still ahead — this doc's earlier sections on those remain design-stage, not yet built.
+**Status:** Living document — single source of truth for this app, alongside `EditEdge_Testing.md`. Built and verified: document parsing (all 4 formats + image/chart extraction), rules taxonomy (133 rules), review engine (4 detection passes), job infrastructure (durable, concurrent), REST API layer, dual-mode auth, Streamlit dev client. Not yet built: the LangGraph conversational shell, Teams/M365 Copilot channel integration, 100MB-scale validation.
 
 ---
 
 ## 1. What this is building
 
-A conversational AI agent, exposed through Teams and Microsoft 365 Copilot, that reviews Word/PowerPoint/Excel/PDF pursuit documents (up to ~100MB) for grammar, style, PwC style-guide compliance, and restricted/risky language — returning structured, categorized findings with suggested rewrites. Advisory-only; no automatic edits.
+A conversational AI agent, exposed through Teams and Microsoft 365 Copilot, that reviews Word/PowerPoint/Excel/PDF pursuit documents (up to 100MB) for grammar, style, PwC style-guide compliance, and restricted/risky language — returning structured, categorized findings with suggested rewrites. Advisory-only; no automatic edits.
+
+**Confirmed important scope boundary**: the REST API described in Section 10 is a **dev/testing surface** (used by the Streamlit client and direct API testing), not the production interface. The real client is Teams, which will get its own endpoint later (Bot Framework Activity handler via the Microsoft 365 Agents SDK) that calls the same underlying `app/jobs/service.py` functions **directly, in-process** — not by round-tripping through this REST API. This is exactly why the real logic lives in `app/jobs/service.py` and not in route handlers: both surfaces can call the same functions without duplicating logic.
 
 ---
 
 ## 2. Guiding principles carried forward
 
-1. **Infrastructure is reusable; the workflow is not.** Auth, DB connection, and config patterns copy from the existing reusable-infra layer. The LangGraph itself — state, nodes, routing — is designed fresh for this agent's actual behavior.
-2. **The review engine is a capability, not graph logic.** Parsing → rule evaluation → findings is a clean, standalone module (`app/documents/`, `app/rules/`, and the forthcoming `app/review/`), callable independently of the chat shell — so a future Office add-in or other consumer can call the same engine without the conversational layer.
-3. **Empirical verification before commitment — this has been the single most consequential discipline in the build so far.** Every non-trivial claim about a library or API has been checked against real, installed code rather than assumed, and this has repeatedly mattered: the async Mongo checkpointer situation, the `pymupdf4llm`-triggers-Tesseract discovery, and — most productively — two full rounds of external code review where roughly half the flagged "bugs" turned out to be incorrect on direct inspection (wrong URI claims, a disproven `Movie subclasses Picture` claim, a `media_type` fix that doesn't actually work in this library version) while the other half were real, reproducible, and got fixed. Every fix in this document was verified against a real fixture, not just reasoned about.
-4. **Deterministic before LLM, always.** Every rule category splits into cheap lookup-based checks and LLM-judgment checks. This is no longer a design intention — the taxonomy (Section 6) has been built and every deterministic rule's regex has been tested against real matching/non-matching text (not just confirmed to compile), which itself caught a real bug (a trailing `\b` word-boundary regex that silently failed to match "U.S." — see Section 6).
+1. **Infrastructure patterns are reusable; the workflow is not.** Job-queue patterns (poll loop, heartbeat, stale-job requeue) are adapted from `knowledge-sync-worker`'s proven design — but EditEdge's job system is meaningfully **simpler**, not a smaller version of the same complexity: no agent registry, no per-agent DB routing, no admin API, because EditEdge is single-agent where `knowledge-sync-worker` is deliberately multi-agent shared infrastructure.
+2. **The review engine is a capability, not graph logic.** `app/documents/` → `app/rules/` → `app/review/` is a clean, standalone pipeline, callable independently of any conversational layer — confirmed by the job worker (`app/jobs/worker.py`) calling it directly with zero LangGraph dependency.
+3. **Empirical verification before commitment — the single most consequential discipline in this build.** Every non-trivial library/API claim has been checked against real, installed code or real request/response behavior, never assumed. This has repeatedly mattered — see `EditEdge_Testing.md` for the full, specific list of real bugs this caught, including several found only after the code was run against the real GenAI endpoint and real MongoDB-shaped test data, not just unit tests.
+4. **Deterministic/lexical before LLM, always.** Rules split into three execution tiers by cost: `DETERMINISTIC` (regex) and `LEXICAL` (bounded term match) run first, free, always; `JUDGMENT` (LLM) runs only where a cheap pattern can't decide. `CONSISTENCY`-category rules get a fourth, structurally separate document-level pass. All four are real, running code — not a design intention.
+5. **Don't build ahead of confirmed need.** Concrete instance: the consistency pass's extract-then-adjudicate redesign (suggested during external review) was deliberately deferred — it trades real context away for a scaling problem that hasn't been confirmed real yet (no 100MB test file exists). Revisit only with real evidence the current design is actually a bottleneck.
 
 ---
 
 ## 3. High-level architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  Channels (via Microsoft 365 Agents SDK — one backend, N channels)│
-│    Teams (1:1 personal scope)      M365 Copilot chat                │
-└───────────────────────────┬───────────────────────────────────────┘
-                             │ Activities (messages, attachments)
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  EditEdge Agent Service (FastAPI + Microsoft 365 Agents SDK)        │
-│  ┌───────────────┐  ┌────────────────────┐  ┌──────────────────┐   │
-│  │ Conversational │  │  Review Engine      │  │ Job Orchestration │   │
-│  │ Shell           │→│  (own module)        │→│  Client            │   │
-│  │ (LangGraph)      │  │  parse→rules→findings│  │  enqueue/status    │   │
-│  └───────────────┘  └────────────────────┘  └──────────────────┘   │
-└───────────────────────────┬───────────────────────────────────────┘
-                             │ job records (Mongo)
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Background Review Worker(s) — scalable, independent process(es)    │
-│   claim job → parse → chunked/batched rule evaluation → findings    │
-│   → write results → proactively notify via stored conversation ref  │
-└─────────────────────────────────────────────────────────────────┘
+Dev/testing clients: Streamlit (streamlit_app/app.py), direct API
+Future production client: Teams (separate endpoint, not yet built)
+        |
+        | HTTP (multipart upload, status polling)
+        v
+FastAPI app
+  app/auth/ (dual-mode)  ->  app/api/v1/documents.py (thin routes)  ->  app/jobs/service.py
+        |
+        | review_jobs (Mongo) + GridFS (raw file bytes)
+        v
+app/jobs/worker.py — N concurrent "slots" (settings.MAX_CONCURRENT_JOBS)
+  each slot: claim (lock-serialized) -> process -> repeat, independently
+  claim excludes users with an already-RUNNING job (real, tested)
+        |
+        v
+app/documents/pipeline.py (parse_and_extract)  ->  app/review/engine.py (review_document)
+  4 parsers + vision OCR                            deterministic -> lexical -> judgment -> consistency
+        |
+        v
+findings (Mongo) + review_jobs status update
 ```
-
-**Built so far, inside the "Review Engine" box**: `app/documents/` (all four parsers + dispatcher + image extraction + pipeline) and `app/rules/` (taxonomy schema + curated content). Not yet built: the engine itself (`app/review/`), job orchestration, the LangGraph shell, and channel integration.
 
 ---
 
-## 4. Data model (MongoDB) — design stage, not yet built
+## 4. Data model (MongoDB) — REAL, implemented
 
 | Collection | Keyed by | Purpose |
 |---|---|---|
-| `sessions` | `_id`, owned by `user_id` | Conversation-adjacent metadata |
-| `checkpoints` / `checkpoint_writes` | `thread_id` | LangGraph conversational state |
-| `review_jobs` | `job_id`, **`user_id`** | Job status, `conversation_reference`, file metadata, timestamps |
-| `findings` | `job_id` | Structured output: category, location, original text, explanation, suggested rewrite, `rule_id` |
-| `knowledge_chunks` | — | Optional, secondary: vectorized style-guide content for `answer_from_knowledge`-style Q&A only |
+| `review_jobs` | `_id`, `user_id` | Job status, applies_to/is_pcs/english_variant intake answers, timestamps, heartbeat, `gridfs_file_id` reference |
+| `findings` | `job_id` | One document per `Finding` — category, location, original text, explanation, suggested rewrite, `rule_id`, `source_reference` |
+| GridFS bucket `review_uploads` | ObjectId | Raw uploaded file bytes — durable, NOT request-scoped memory (see Section 9's reasoning on why this matters for an in-process worker) |
+| `sessions`, `checkpoints`/`checkpoint_writes` | — | Still design-stage — belong to the not-yet-built LangGraph shell |
 
-**Correction from the original draft**: the rules taxonomy is **not** a MongoDB collection. It's built as static, code-authored Python (`app/rules/schema.py` + `app/rules/taxonomy.py`) — matching the already-confirmed decision that rule curation is static for MVP (code change + redeploy, not admin-managed). See Section 6.
-
-**One active job per user, enforced at the `review_jobs` layer**, checked across all conversations.
+The rules taxonomy is **not** a database collection — confirmed, static, code-authored Python (`app/rules/taxonomy.py`), matching the discovery-phase decision that rule curation is static for MVP.
 
 ---
 
-## 5. LangGraph design — design stage, not yet built
+## 5. LangGraph design — still design-stage, not yet built
 
-**State includes**, beyond the standard `messages`/`session_id`/`user_id`:
-- `intent` — classified every turn, job-state-aware
-- `active_job_id` / `job_status` — read from `review_jobs`, not duplicated into the checkpoint
-- `document_type` — `"general" | "audit"`, captured once at intake, drives which rules apply (see Section 6 — this is now a concrete, confirmed-real distinction, not a hypothetical)
-
-**Intent taxonomy** (draft): `social | off_topic | knowledge_question | submit_document | check_status | finding_followup | scope_change | new_document | additional_output | unclear`
-
-**Hard safety override, non-negotiable**: while a job is `running`, `submit_document`/`new_document` intents never silently cancel it.
-
-**Two completion paths**: proactive push (primary, via stored `conversation_reference`) and status check (fallback). Verify both work identically across Teams/M365 Copilot before relying on either as primary.
+Unchanged from prior versions of this doc. Nothing in Sections 6-11 below depends on this being built — the review engine and job system are fully functional headless of any conversational layer, confirmed by direct testing (the worker calls `review_document()` with zero LangGraph involvement).
 
 ---
 
 ## 6. Rules taxonomy — BUILT AND VERIFIED
 
-Lives in `app/rules/`, not MongoDB (see Section 4 correction). Two files:
+`app/rules/` — three files:
 
-**`app/rules/schema.py`** — the data model. A `Rule` is a frozen dataclass (same reasoning as `app/documents/base.py`: static, code-authored data, no Pydantic needed at this layer) with:
-- `category`: `grammar | punctuation | capitalization | numbers_formatting | risk_language | audience_sensitivity | brand_voice | consistency` — `consistency` is document-level only (terminology drift, duplicate content), handled by a separate pass in the engine, not the per-block passes.
-- `detection_type`: `deterministic | judgment`
-- `applies_to`: `general | audit` — **confirmed real and conflicting**, not a hypothetical: Appendix B contains an audit/Trust Solutions overlay where words like "assist," "collaborate," and "chemistry" are unrestricted generally but explicitly restricted in audit proposals. Resolved once per review by asking the user directly at intake, not auto-detected.
-- `trigger_terms`: a cheap keyword pre-filter for judgment rules keyed to specific words (most of Appendix B) — a block containing none of a rule's trigger terms skips that rule's LLM check entirely; containing one still requires the LLM to judge whether it's used in the restricted *sense*. This is a real cost-control mechanism, not a contradiction of "judgment needs the LLM."
-- `source_reference`: a plain citation string (e.g. `"Style Guide p.89 (Appendix B)"`) citing the source document's own **printed** page numbers — deliberately never derived from any parser's `page_number`/`paragraph_index`, since a parser's page count is physical document order and can diverge from what's actually printed on a page (cover pages, TOCs, restarted numbering). This keeps taxonomy citations verifiable by a human against the real document, independent of parser internals.
+- **`schema.py`** — the data model. `Rule` is a frozen dataclass with: `category`, `detection_type` (`DETERMINISTIC | LEXICAL | JUDGMENT`), `applies_to` (`GENERAL | AUDIT`), `english_variant` (`None | US | GLOBAL`), `pcs_exception: bool`, `pattern`, `match_validator` (optional post-match callable — see below), `trigger_terms`, `alternative`, `explanation`, `example_before/after`, `source_reference`. `RuleSet.validate()` runs at import time and enforces field-combination consistency per detection type (catches curator errors at deploy, not on first document).
+- **`validators.py`** — the small amount of real *logic* the taxonomy needs (e.g. `is_ascending_range`, used to reject phone-number-shaped false positives from the numeric-range rule — a real bug found via production testing, see `EditEdge_Testing.md`). Kept separate so `taxonomy.py` stays pure declarative data.
+- **`taxonomy.py`** — the actual curated content.
 
-**`app/rules/taxonomy.py`** — the actual curated content. **56 rules currently**, built from real source material (Grammatical Topics.docx in full, plus the style guide sections received so far: grammar/punctuation, Numbers, Appendix B including the audit overlay, Appendix C gender-neutral terms, and the brand messaging guide's literal-word restriction). Breakdown: 15 deterministic, 41 judgment; 47 general rules, 9 audit-specific additions.
+**Current real numbers** (confirmed, not estimated): **133 rules** — 41 `DETERMINISTIC`, 17 `LEXICAL`, 75 `JUDGMENT`. 117 apply generally; 16 more activate for `AUDIT` documents (133 total when `applies_to=AUDIT`). 2 rules carry `pcs_exception=True` (`risk-audit-advisor-terms`, `risk-audit-collaborate`) — **confirmed directly against the real style guide** (p.95-96, the asterisked PCS exception), not secondhand. 8 rules are `EnglishVariant.GLOBAL`-only and **confirmed inert by default** (tested directly: identical text produces 0 findings under the default `US` call, 1 finding when `GLOBAL` is explicitly requested) — correctly gated behind an intake question that doesn't exist yet in the conversational flow.
 
-**Deliberately not exhaustive**: Word usage (US) and Global English sections remain thin in the source material received so far. Adding more rules later is purely additive to `taxonomy.py` — it requires no change to the review engine, which consumes whatever rules exist without caring how many there are.
+**Detection-type decision rule, confirmed and applied consistently**: if the source's own alternative-language column says "avoid using"/"delete" unconditionally → `LEXICAL`. If it says "may be acceptable when..." → `JUDGMENT`. If it's a structural pattern (dashes, digit grouping, spacing) → `DETERMINISTIC`.
 
-**Verification discipline applied and validated**: every deterministic rule's regex was tested against real matching and non-matching text, not just confirmed to compile. This caught a real bug — `punc-acronym-no-periods`'s original pattern had a trailing `\b` that silently failed to match "U.S." (a period followed by a space has no word-boundary transition, since both characters are non-word characters) — fixed and reverified. This is now the standing convention for any future rule additions: compiling is not sufficient evidence a pattern works.
+**`match_validator`, a real, tested escape hatch** for rules where pure regex can match the *shape* but not the real condition — e.g., `numbers-range-should-use-en-dash`'s pattern matches `\d+-\d+` but can't tell a genuine range ("pages 15-22") from a phone-number fragment ("858-677"); `is_ascending_range` rejects descending pairs (real ranges are essentially never descending) as a free, no-LLM partial fix. `RuleSet.validate()` enforces this field is only ever set on `DETERMINISTIC` rules.
 
-**Runtime execution** (for the forthcoming review engine): deterministic rules run first, on every block, cheaply. Judgment rules run only for blocks matching at least one `trigger_terms` keyword (where the rule has any), batched into LLM calls rather than one call per rule per block. The `consistency` category and any document-level concern get a separate pass over the whole document's extracted terms after per-block passes complete, not folded into per-block execution.
+**Deliberately not exhaustive**: Word usage (US) and Global English sections cover what real source content has actually been transcribed and verified — see `EditEdge_Testing.md`'s note on the "verbatim transcription, cite the real printed page" discipline used for every single rule.
+
+**Runtime execution** (`app/review/engine.py`): deterministic + lexical run first, on every block, free. Judgment rules run only for blocks matching at least one `trigger_terms` keyword (rules with no `trigger_terms` — mostly grammar rules with no useful keyword pre-filter — are always candidates, confirmed ~75% of judgment rules fall in this category), batched into LLM calls via structured output. `CONSISTENCY`-category rules get a separate, whole-document pass.
 
 ---
 
 ## 7. Document processing — BUILT AND VERIFIED
 
-**Formats supported**: Word (`.docx`), PowerPoint (`.pptx`), Excel (`.xlsx`, all tabs), PDF. ODP explicitly out of scope.
+Unchanged in substance from prior versions of this doc — all four parsers (`docx`, `pptx`, `xlsx`, `pdf`), the dispatcher, and image/chart extraction remain as previously documented, with one **new, real production fix**:
 
-**Module layout** (`app/documents/`):
-- `base.py` — common representation (`ParsedDocument`, `ContentBlock`, `Location`, `UnsupportedItem`) every parser produces. Plain dataclasses, not Pydantic — high-volume, hot-path objects (a 100MB document can produce thousands of instances), validated only where they cross a real boundary later.
-- `docx_parser.py`, `pptx_parser.py`, `xlsx_parser.py`, `pdf_parser.py` — one parser per format, verified against real library source and real generated fixtures, not assumed.
-- `dispatcher.py` — single entry point, routes by extension, enforces `MAX_FILE_SIZE_MB` centrally.
-- `image_extraction.py` — turns flagged images into reviewable text via a vision-capable LLM call (LangChain `ChatOpenAI`, not the raw `openai` SDK — matches the rest of the codebase's LLM-call convention).
-- `pipeline.py` — the async orchestration layer connecting the sync dispatcher to the async image-extraction step (`parse_and_extract()`); this is the actual entry point downstream consumers should use, not `dispatcher.parse_document()` directly, unless deliberately skipping image review.
+**Image format normalization** (`app/documents/image_extraction.py`) — the vision endpoint (Azure OpenAI, fronted by LiteLLM — both facts confirmed directly from a real production error's traceback, previously unknown about this project's infrastructure) rejects any image format outside jpeg/gif/webp/png. None of the four parsers validate or convert the native format they extract (JPEG2000, JBIG2, TIFF, BMP are all real possibilities from scanned/complex documents, not edge cases) — confirmed as a real failure via the first real-endpoint test against an actual audit RFP PDF. Fixed by normalizing every image to PNG via Pillow **before** the vision request is built, regardless of source format — verified against the exact failure scenario (a non-PNG source image) and confirmed working in a second real production run (block count went 6→7, meaning the previously-failing extraction now succeeds).
 
-**Images and charts are reviewed, not just flagged** — this supersedes the original draft's "unreviewable content, explicitly flagged as not reviewed" framing. Concretely:
-- **Images**: text embedded in an image is extracted via a vision LLM call and reviewed like any other text, across all four formats. A generic fallback icon (PowerPoint's default "media loudspeaker" placeholder for audio/video with no real poster frame) is detected by direct byte comparison against the library's own known constant and excluded from review rather than sent through vision extraction as if it were meaningful content.
-- **Charts**: labels (title, series names, category labels) are extracted directly via each format's own chart API where available (PowerPoint has this; Word and Excel do not, flagged-only for chart *content* in those formats) and reviewed as text. The underlying chart *data/visual layout* remains out of scope in all formats.
-- **SmartArt**: still flagged-only, still unverified by a real fixture in PowerPoint (the library has no API to create SmartArt for testing) — must be confirmed against a real SmartArt-containing file before being trusted in production.
-
-**Real bugs found and fixed across two rounds of review** (verified via direct reproduction in every case, not accepted on the reviewer's word — several claimed "bugs" were disproven the same way):
-- **docx**: nested tables (a table inside a table cell) were completely invisible via `doc.tables` — fixed by refactoring to `iter_inner_content()`, which also fixed paragraph/table interleaving order as a side effect. Merged cells were then found to be processed multiple times by the refactor (row.cells repeats the same underlying element per grid position spanned) — fixed via identity-based dedup. Floating/wrapped images (`wp:anchor`, not just `wp:inline`) were invisible — fixed. Images/OLE objects inside table cells were invisible — fixed. EMF/WMF images crashed the parser (python-docx's own image-format exceptions aren't `AttributeError` subclasses) — fixed with a raw-bytes fallback. Linked (not embedded) pictures were misreported as parse failures — now correctly identified. `mc:AlternateContent` (a real Word backward-compatibility pattern) could double-count the same image — deduped by relationship ID.
-- **pptx**: populated picture placeholders (e.g. the "Picture with Caption" layout) were **silently dropped entirely** — `shape_type` reports `PLACEHOLDER`, not `PICTURE`, even when populated; fixed via an `isinstance(shape, Picture)` check, reproduced and verified against a real layout. A final "unhandled shape" safety net was added so nothing (movies, connectors, any future shape type) is ever silently dropped again. Movie/audio media was confirmed to already reach that safety net correctly (an initial review claim that it would crash or be mis-extracted was disproven by reading the actual library source — `Movie` and `Picture` are siblings, not parent/child) but was being mislabeled and discarding a real, extractable poster-frame image; fixed with a dedicated media branch.
-- **xlsx**: `read_only=True` mode (required for memory efficiency at scale) doesn't expose charts/images at all — solved by reading the `.xlsx` zip container's relationship chain directly (`workbook.xml` → sheet rels → drawing rels → media), verified against real generated fixtures, not assumed from documentation. Hardened against a rich-text cell value crash and malformed relationship files.
-- **pdf**: `page.get_images()` reports images merely *referenced* in a page's (possibly inherited) `/Resources` dictionary, not necessarily images actually *displayed* on that page — confirmed via pymupdf maintainer guidance, this could cause false "scanned page" flags and duplicate/mislocated image items. Fixed by switching to `page.get_image_info(xrefs=True)`, which reports only actually-rendered images with a real bounding box.
-
-**Known, explicitly documented limitations** (not silently missing — see each parser's own docstring for the full list): headers/footers/footnotes/textboxes (docx), tracked-change deletions (docx), chartsheets and cell comments (xlsx), annotation-embedded images and vector-graphic charts (pdf), cross-page image deduplication (deferred to the future extraction/orchestration layer, not the parser).
-
-**Page/location numbering caveat, worth stating plainly**: a parser's `page_number`/`paragraph_index` reflects physical document order as the parser counts it — it is not guaranteed to match a document's own printed page labels (a PDF with a cover page and TOC will have physical page 5 show a printed "Page 3," for instance). Findings should be understood as "document order," not a promise of matching a visible printed number.
-
-**Not yet load-tested at 100MB** — every fixture used in verification so far has been small, synthetically generated. This remains the single largest unverified risk in the parsing layer and needs a real large-file spike before production commitment.
+**Not yet load-tested at 100MB** — still the single largest unverified risk in the parsing layer.
 
 ---
 
-## 8. Channel integration — design stage, not yet built
+## 8. Review engine — BUILT AND VERIFIED
 
-**Framework**: Microsoft 365 Agents SDK for Python, custom engine agent tier (own orchestrator, SDK as channel layer only).
+`app/review/` — six files, all with real, direct-tested logic (not just import-checked):
 
-**Confirmed, real platform constraints**:
-- Teams: file attachments work reliably, personal 1:1 scope only; can't be tested via local Playground/dev tunnel.
-- M365 Copilot app channel: documented, currently-open known issue where file attachments can silently fail to reach a custom engine agent's backend — must be spiked against the real tenant before committing to it as primary.
-- Fallback if confirmed broken: SharePoint/OneDrive link-based intake for that channel specifically.
+- **`models.py`** — `Finding` (Pydantic, the full internal/API-facing representation) and `LLMJudgmentFinding`/`LLMJudgmentBatchResponse` (the *minimal* schema asked of the LLM — deliberately excludes anything already known deterministically from the `Rule` being checked, reducing tokens and hallucination surface).
+- **`deterministic.py`** — `run_deterministic_rules()` (regex, applies `match_validator` when present) and `run_lexical_rules()` (bounded term match). Both use `app/review/matching.py`'s lookaround-based matching, not naive substring or `\b`-based matching — confirmed via direct testing that naive substring matching produced real false positives ("who" matching inside "whole," "trust" matching inside "Trust Solutions") and that `\b` itself fails for symbol-starting/ending triggers (confirmed: `\b&\b` doesn't match "risk & capital" at all, same failure class as an earlier acronym-regex bug).
+- **`judgment.py`** — batched, structured-output LLM calls with a `trigger_terms`-based candidate pre-filter, per-batch failure isolation (one bad batch is logged and skipped, not fatal to the whole review).
+- **`consistency.py`** — the document-level pass for `CONSISTENCY`-category rules, sending the whole document in one call. Explicitly **not yet redesigned for 100MB scale** (see Section 2, principle 5) — a 200-block truncation cap exists as a stopgap, not a real solution.
+- **`matching.py`** — the shared, tested term-matching utility both `deterministic.py` and `judgment.py` depend on.
+- **`engine.py`** — `review_document()`, the single entry point tying `app/documents/` output + `app/rules/RULE_SET` into a `list[Finding]`. Signature: `review_document(parsed, rule_set, applies_to, judgment_model, english_variant=US, is_pcs=False)`. Correctly applies `RuleSet.for_applies_to_with_pcs()` and `RuleSet.for_english_variant()` — **a real bug was found and fixed here**: an earlier version bypassed both of those methods with hand-rolled inline filtering, meaning the entire PCS carve-out was built but completely unreachable (no `is_pcs` parameter existed at all). Confirmed fixed by direct end-to-end test.
 
-**Azure Bot auth**: Managed Identity is the target for production (no stored secret); local dev/Teams-channel testing needs a temporary Client Secret + devtunnel, since Managed Identity only works when actually hosted on Azure infrastructure with the identity attached.
-
-Consider `microsoft-agents-a365` for production observability/notifications.
-
----
-
-## 9. Explicitly deferred (Phase 2+)
-
-- **Marked-up/annotated output files, auto-apply edits** — the review engine returns structured findings independent of any output renderer; additive later.
-- **Accept/reject tracking** — needs a `decision` field on findings; additive.
-- **Admin-managed / self-service rule updates** — `app/rules/taxonomy.py` is already the right shape conceptually; Phase 2 would add an authoring UI/storage backend on top, not change the schema.
-- **Region/LoS/proposal-type rule variation beyond general/audit** — `AppliesTo` already generalizes; extending it is additive.
-- **Scanned-page OCR** — distinct from the image-text extraction already built (Section 7): a scanned page's *entire content* being run through OCR is still parked, flagged `NOT_APPLICABLE` for now pending an explicit decision.
-- **Vector-graphic chart detection in PDFs** — flagged as a hard, unreliable heuristic problem in Section 7; not attempted.
-- **Multi-document handling** — genuinely undecided even in concept; don't let it silently default to "blend everything."
+**Real bugs found and fixed in this layer** (full detail in `EditEdge_Testing.md`): the PCS-unreachable bug above; `punc-double-space-after-period` and `numbers-sentence-initial-spell-out` regexes capturing surrounding context into `original_text` (confusing user-facing output, not just cosmetic); the substring/word-boundary matching bugs above; a taxonomy transcription bug where two distinct source table rows (`ensure/insure/assure` vs. `certify/guarantee/promise/validate/verify/warrant`) had been merged into one rule using only the second row's alternative wording.
 
 ---
 
-## 10. Tech stack — versions confirmed against real installed packages, not memory
+## 9. Job infrastructure — BUILT AND VERIFIED
+
+`app/jobs/` — six files. Confirmed decision: **in-process** with the FastAPI app (asyncio background tasks started from the lifespan), not a separately deployed service like `knowledge-sync-worker` — appropriate because EditEdge is single-agent, where that operational simplicity outweighs a separate deployment's benefit at this stage.
+
+- **`schema.py`** — `ReviewJob` (Pydantic), `JobStatus` enum.
+- **`storage.py`** — GridFS wrapper (`gridfs.AsyncGridFSBucket`, confirmed correct current import path — NOT under `pymongo`, a real thing to get wrong). Durability of the raw file bytes (not just job status) is what makes heartbeat/stale-job-requeue *actually* meaningful for an in-process worker — an in-memory-only file would be unrecoverable after a process crash regardless of what the job record says.
+- **`repository.py`** — job CRUD plus the two operations worth being precise about:
+  - `claim_next_pending_job()` — atomically claims the oldest pending job **belonging to a user who doesn't already have a job RUNNING** (excludes via `distinct()` + `find_one_and_update()`'s `$nin` filter). **Confirmed via direct testing NOT safe to call concurrently without external serialization** — the read-then-write pair has a genuine TOCTOU race (two concurrent calls can both read "no one running" before either commits); `worker.py`'s shared `asyncio.Lock` fixes this, confirmed by reproducing the race, applying the fix, and re-testing to confirm resolution.
+  - `requeue_stale_jobs()` — resets a `RUNNING` job with a stale heartbeat back to `PENDING`.
+- **`findings_repository.py`** — persists `Finding` objects keyed by `job_id`.
+- **`service.py`** — `submit_review_job()`, the real entry point for any future caller (REST route, future Teams handler). Enforces `MAX_QUEUED_JOBS_PER_USER` for the first time (the setting existed in config since early in the build with nothing checking it until now).
+- **`worker.py`** — **N persistent "worker slots"** (`settings.MAX_CONCURRENT_JOBS`), each independently claiming and processing jobs in its own loop — not a bounded-batch-then-wait design (rejected: wastes capacity if some batched jobs finish faster than others) and not an explicit `asyncio.Semaphore` guarding one shared loop (the slot-pool pattern needs neither — concurrency is naturally bounded by "N slot coroutines exist," and every slot self-heals independently, so one slot crash-looping doesn't reduce total capacity to zero). **Confirmed via direct, timestamped testing**: two different users' jobs genuinely run concurrently; two jobs from the same user genuinely stay sequential (the fairness/resource-protection property "one active job per user" was designed to guarantee) — not just asserted, watched fail once, fixed, and watched pass.
+
+**Honest, stated limitation**: heartbeat updates only at phase boundaries (claimed, after-parse, after-review, completed), not mid-batch within a single long LLM call — `STALE_JOB_THRESHOLD_SECONDS` must be set generously relative to real batch durations until/unless this gets finer-grained (a real, contained future change once 100MB timing data exists to size it against).
+
+---
+
+## 10. API layer — BUILT AND VERIFIED (dev/testing surface — see Section 1)
+
+`app/api/v1/documents.py` + `schemas.py` — thin routes; all real logic lives in `app/jobs/service.py`/`repository.py`. Confirmed via a full, real `TestClient` request cycle (real multipart upload → job processing → status/findings retrieval), not just unit-tested in isolation:
+
+- **`POST /documents/review`** — accepts file + `applies_to`/`is_pcs`/`english_variant`, rejects unsupported file types immediately (before queueing a job that would just fail later), returns 202 + `job_id`.
+- **`GET /documents/review/{job_id}`** — status + findings once `succeeded`. Returns 404 (not 403) for a job that exists but belongs to a different user — confirmed via direct test, avoids leaking job existence across users.
+
+**Auth — `app/auth/dependencies.py`**, dual-mode via `settings.AUTH_MODE`:
+- `"header"` (default) — reads `X-User-Id` directly, matching the confirmed reality that Entra auth wasn't implemented in the app this pattern is modeled on.
+- `"entra"` — delegates to the **real** `app/auth/entra.py` (not a separate reimplementation — an earlier version of this dependency had its own independent JWKS/audience-check logic, removed once the real module was available, to avoid two token-validation implementations silently drifting apart). Confirmed working via direct test against the real `entra.py` code (header mode, entra dev-bypass mode, missing-token rejection).
+
+**Real finding from testing, not yet resolved, your call**: `entra.py`'s `AUTH_DEV_BYPASS` path returns early and skips the tenant guard entirely, not just signature verification — confirmed via direct test (a token with a different tenant ID was accepted in dev-bypass mode). Gated behind `not IS_PRODUCTION` either way, so not exploitable as currently configured, but the comment above the tenant check reads as if it always applies, when it doesn't in bypass mode. Flagged, not changed — it's your file.
+
+---
+
+## 11. Dev client — Streamlit
+
+`streamlit_app/app.py` — explicitly a **dev/testing tool**, not the production interface (see Section 1). Built against `streamlit==1.61.1` (confirmed current stable at build time via direct install, not assumed) using the current, non-experimental polling pattern (`@st.fragment(run_every="3s")`, `st.rerun()`) and current sizing convention (`width="stretch"`, not the older `use_container_width=True`). Upload → submit → auto-polling status panel → categorized findings display with CSV export.
+
+**Tested headlessly via Streamlit's own `AppTest` framework** (not just written and assumed correct) across five real scenarios: initial render, full findings display (mocked with real-shaped `JobStatusResponse` data), pending, clean-document, and failed states — all confirmed rendering with zero exceptions.
+
+**Genuinely untested**: live polling against a real running FastAPI server (both processes were never run together in this environment), and real browser CSV-download behavior.
+
+---
+
+## 12. Channel integration — design stage, not yet built
+
+Unchanged from prior versions. Confirmed important clarification (Section 1): Teams will call `app/jobs/service.py` functions **directly, in-process**, not through the REST API in Section 10.
+
+---
+
+## 13. Explicitly deferred (Phase 2+)
+
+Unchanged from prior versions, plus:
+- **Consistency pass extract-then-adjudicate redesign** — deliberately deferred, see Section 2 principle 5. Revisit only with real evidence from the 100MB spike that the current design is a genuine bottleneck.
+- **Fine-grained job heartbeat** (mid-batch, not just phase-boundary) — real, contained future work once real 100MB timing data exists to size `STALE_JOB_THRESHOLD_SECONDS` against properly.
+- **`entra.py`'s dev-bypass tenant-guard gap** — flagged in Section 10, your call whether to fix.
+
+---
+
+## 14. Tech stack — versions confirmed against real installed packages
 
 | Layer | Choice | Note |
 |---|---|---|
-| Python | 3.13 | Confirmed compatible with every dependency below via wheel-availability checks (all pure-Python or `abi3`/stable-ABI wheels) |
-| API framework | FastAPI | — |
-| Orchestration | LangGraph 1.2.10 | — |
-| Checkpointer | `langgraph-checkpoint-mongodb` 0.4.0, `langgraph.checkpoint.mongodb.MongoDBSaver` (sync client + async wrapper methods) | Confirmed via direct package introspection: no dedicated async-native saver class exists in this release, despite some external docs implying otherwise — verified by installing and inspecting, not trusted from search results |
-| DB driver | PyMongo native async (`AsyncMongoClient`) | Motor deprecated/EOL |
-| GenAI client | `langchain-openai` 1.4.2 (`ChatOpenAI`) + `langchain-core` 1.5.3 | One shared client per app instance (`app/llm.py`), constructed once at startup and reused via `.bind()` for per-use-case parameters (e.g. image extraction's `temperature=0`) — NOT a fresh client per call, since `ChatOpenAI` wraps a real pooled HTTP connection. Confirmed current multimodal content-block format (`HumanMessage(content_blocks=[...])`) rather than the legacy OpenAI-style `image_url` dict, which this LangChain version has moved past |
-| Document parsing | `python-docx` 1.2.0, `python-pptx` 1.0.2, `openpyxl` 3.1.5, `pymupdf` 1.28.2 | All confirmed current; `pymupdf4llm` present in requirements but deliberately unused in the core parser — triggers undeclared Tesseract OCR as a side effect, confirmed during verification |
-| XML parsing | `lxml` 6.1.1 | Used directly for xlsx's zip-container relationship-chain reading and docx's raw graphic-element inspection |
-| Teams/Copilot channel layer | Microsoft 365 Agents SDK for Python | Not yet integrated |
-| Background job execution | Not yet decided | Candidates: Celery/arq/taskiq, or a bespoke poll-loop matching `knowledge-sync-worker`'s proven pattern |
+| Python | 3.13 | Unchanged |
+| API framework | FastAPI 0.141.1 | Confirmed current via direct install; multipart (`UploadFile.size`, `Form()` Enum/bool coercion) verified via real `TestClient` requests, not assumed |
+| Orchestration | LangGraph 1.2.10 | Not yet integrated |
+| DB driver | PyMongo native async (`AsyncMongoClient`), `pymongo.ReturnDocument` | Confirmed `find_one_and_update()` is a genuine atomic single-document operation |
+| File storage | `gridfs.AsyncGridFSBucket` | Confirmed correct import path (top-level `gridfs` package, not `pymongo.gridfs`) |
+| Auth | PyJWT 2.10.1, `PyJWKClient` | Real `entra.py` in use, not a placeholder |
+| GenAI client | `langchain-openai`/`langchain-core`, shared `ChatOpenAI` instance | Confirmed real infrastructure: Azure OpenAI fronted by LiteLLM (learned from a real production error trace) |
+| Document parsing | `python-docx`, `python-pptx`, `openpyxl`, `pymupdf`, Pillow | Pillow now load-bearing for image format normalization, not just testing |
+| Dev client | Streamlit 1.61.1 | Confirmed current |
+| Background job execution | In-process asyncio worker pool (`app/jobs/worker.py`) | Confirmed decision over a separate deployed service or a library (Celery/arq) — see Section 9 |
 
 ---
 
-## 11. Production-grade concerns to build in from day one
+## 15. Still-open items
 
-- **Idempotency on job processing** — not yet built (job infrastructure is ahead).
-- **Per-user rate/concurrency limiting** against the shared GenAI service — real, still-open concern; `image_extraction.py`'s `max_concurrent` parameter (default 5, explicitly flagged as an untuned guess) is the first place this will need real tuning once cost/latency data exists.
-- **Cost observability** — not yet built.
-- **Verification-before-trust as a coding discipline** — this has become a de facto production-grade practice over the course of this build: every library API claim gets checked against the real installed package (via sandbox introspection or fixture testing) before code is written against it, and every fix proposed by external review gets independently reproduced before being accepted. This has caught real bugs that would otherwise have shipped, and also prevented several unnecessary "fixes" for claims that didn't hold up under direct testing.
-
----
-
-## 12. Still-open items
-
-1. Real ~100MB test files (Word-heavy, PPT-heavy, Excel-heavy) — parser and worker behavior still completely unverified at scale. Highest-priority open item.
-2. The real GenAI endpoint's vision-call behavior — `image_extraction.py`'s logic is verified via mocking only; the actual `GENAI_BASE_URL`/`GENAI_API_KEY` endpoint has never been called.
-3. File-upload spike: Teams vs. M365 Copilot custom-engine-agent attachment delivery.
-4. Proactive-messaging spike across both channels.
-5. Acceptable turnaround-time target for a full large-file review.
-6. Word usage (US) and Global English sections — still thin; affects taxonomy completeness, not the engine's design.
-7. SmartArt detection (pptx) — implemented per documented namespace spec, never confirmed against a real SmartArt-containing file.
-8. Job-queue library decision — deferred to when job infrastructure is actually built.
-9. Excel chart/image detection during the large-file spike specifically — the zip-relationship-chain approach was verified on small fixtures only.
+1. Real ~100MB test files — still the highest-priority open item; blocks validating the parsing layer, the consistency pass's scalability, and `MAX_CONCURRENT_JOBS`/`STALE_JOB_THRESHOLD_SECONDS` tuning all at once.
+2. `GENAI_LLM_MODEL`'s real value — every use so far has been a placeholder (`"azure.gpt-4.1"`), never confirmed as the real model string your endpoint expects.
+3. `entra.py`'s dev-bypass tenant-guard gap (Section 10) — a decision, not a blocker.
+4. Live Streamlit ↔ real-API integration — never run together in this environment.
+5. `AUTH_MODE="entra"`'s full production path — validated logic-level (mocked JWKS), never against a real Entra tenant's real signing keys.
+6. Job-system settings (`MAX_CONCURRENT_JOBS`, `POLL_INTERVAL_SECONDS`, `STALE_JOB_THRESHOLD_SECONDS`, `MAX_QUEUED_JOBS_PER_USER`) — all real, working code, all untuned defaults.
+7. Word usage (US)/Global English taxonomy coverage — grows as more real source pages are supplied; doesn't require engine changes.
 
 ---
 
-**Next step:** the review engine (`app/review/`) — models, deterministic rule runner, judgment/LLM rule runner, and the orchestrating engine that ties the taxonomy (Section 6) to parsed documents (Section 7) and produces `Finding` objects.
+**Next step:** your call — job infra + API + dev client together now form a complete, testable slice. Natural next pieces are either the LangGraph conversational shell, or closing out the still-open items above (especially #1 and #2) before building further.

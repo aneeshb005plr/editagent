@@ -15,6 +15,7 @@ from app.utils.error_handlers import register_error_handlers
 from app.utils.access_log_filter import configure_access_log_filter
 from app.api.v1.router import router
 from app.llm import connect_genai, close_genai
+from app.jobs.worker import start_worker, stop_worker
 
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await asyncio.to_thread(connect_checkpointer, app)
         connect_genai(app)  # cheap/non-blocking, no need for to_thread
 
+        start_worker(app)
+
 
         app.state.ready = True
         logger.info("%s startup complete", settings.AGENT_NAME)
@@ -68,6 +71,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         )
 
         # Best-effort cleanup of whatever partially came up.
+
+        await _safe_async(
+            "worker",
+            stop_worker(app)
+        )
         _safe_sync(
             "checkpointer",
             lambda: close_checkpointer(app),
@@ -86,6 +94,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.ready = False
 
     # Symmetric with startup-abort cleanup above.
+    await _safe_async(
+        "worker",
+        stop_worker(app)
+    )
     _safe_sync(
         "checkpointer",
         lambda: close_checkpointer(app),
