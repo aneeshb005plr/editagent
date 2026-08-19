@@ -54,7 +54,8 @@ judgment.py's/consistency.py's batch loops - a contained, worthwhile
 future change once real 100MB timing data exists to size it against,
 not attempted here ahead of that evidence.
 
-REQUIRES THREE CONFIG SETTINGS not yet present in config.py:
+REQUIRES THREE CONFIG SETTINGS - now present in config.py (see
+app/config.py's "Job system" section):
 
     POLL_INTERVAL_SECONDS: int = 5
     # How often an idle slot re-checks for a new pending job.
