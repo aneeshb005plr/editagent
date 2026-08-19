@@ -47,6 +47,19 @@ EnvironmentType = Literal[
     "production",
 ]
 
+AuthModeType = Literal[
+    "header",
+    "entra",
+]
+# Matches EnvironmentType's own pattern - an invalid AUTH_MODE now
+# fails at STARTUP (Pydantic's own Literal validation), not on the
+# first request. Previously a bare `str`, only checked at request
+# time inside app/auth/dependencies.py's get_current_user_id() (a
+# RuntimeError raised mid-request, not at deploy) - fixed for
+# consistency with this file's own established fail-fast philosophy
+# (see _validate_required_in_production below, which follows the
+# same principle for a different set of fields).
+
 
 class Settings(BaseSettings):
     """EditEdge application settings - single source of truth."""
@@ -96,10 +109,19 @@ class Settings(BaseSettings):
     GENAI_API_KEY: Optional[SecretStr] = None
 
     GENAI_LLM_MODEL: str = "azure.gpt-4.1"
+    # STILL UNCONFIRMED against your real endpoint - every use of
+    # this value so far (test scripts, this default) has been a
+    # placeholder, never confirmed as the actual model string your
+    # GenAI service expects. Verify before relying on this default.
 
     GENAI_EMBEDDINGS_MODEL: str = (
         "azure.text-embedding-3-small"
     )
+    # RESERVED / not yet used by anything built so far - the review
+    # engine (app/review/) uses GENAI_LLM_MODEL directly for both
+    # judgment/consistency passes and vision extraction; embeddings
+    # would only be needed by the future secondary vector-store Q&A
+    # feature (style-guide chat), not yet built.
 
     GENAI_MAX_TOKENS: int = Field(
         default=4096,
@@ -118,7 +140,116 @@ class Settings(BaseSettings):
     DB_NAME: str = "agent_editedge"
 
     # ------------------------------------------------------------------
-    # Microsoft Graph
+    # Authentication
+    # ------------------------------------------------------------------
+
+    AUTH_MODE: AuthModeType = "header"
+    # "header" (default): reads X-User-Id directly, no cryptographic
+    # validation - matches the confirmed reality that Entra auth
+    # wasn't implemented in the app this pattern is modeled on.
+    # "entra": delegates to the real app/auth/entra.py JWT validation
+    # - see app/auth/dependencies.py.
+
+    ENTRA_TENANT_ID: str = ""
+    # FIXED REAL ISSUE: previously `str` with NO default, meaning it
+    # was unconditionally required - Settings() construction would
+    # fail at import time in local/header-mode dev unless this was
+    # set, even though AUTH_MODE="header" (the default) doesn't use
+    # Entra at all. Now optional by default; _guard_auth below
+    # requires it ONLY when AUTH_MODE="entra" is actually selected -
+    # same conditional-requirement pattern as
+    # _validate_required_in_production uses for production-only
+    # fields.
+
+    AUTH_DEV_BYPASS: bool = False
+    # Never on in prod - enforced by _guard_auth below. Note this
+    # flag lives entirely inside app/auth/entra.py's own
+    # decode_token() - confirmed via direct testing that its
+    # early-return path also skips the tenant guard check, not just
+    # signature verification. Flagged in the architecture doc as a
+    # real, undecided question - not something this config change
+    # resolves.
+
+    # ------------------------------------------------------------------
+    # Document intake / upload behaviour
+    # ------------------------------------------------------------------
+
+    MAX_FILE_SIZE_MB: int = Field(
+        default=100,
+        gt=0,
+        # 100MB is a confirmed, non-negotiable product requirement -
+        # see architecture doc Section 7. Not a guess.
+    )
+
+    SUPPORTED_FILE_EXTENSIONS: List[str] = Field(
+        default_factory=lambda: [".docx", ".pptx", ".xlsx", ".pdf"]
+        # ODP explicitly out of scope - confirmed in discovery phase.
+        #
+        # KNOWN REAL DRIFT RISK, not yet fixed: app/documents/
+        # dispatcher.py's supported_extensions() is hardcoded from
+        # its own _PARSERS dict and does NOT read this setting at
+        # all - confirmed by inspecting dispatcher.py directly.
+        # Changing this value currently has NO effect on what files
+        # the dispatcher actually accepts. dispatcher.py's own
+        # docstring already flags this exact risk ("config.
+        # SUPPORTED_FILE_EXTENSIONS should be validated against
+        # supported_extensions() ... rather than maintained as a
+        # second, independent list that can silently drift"). Not
+        # fixed here - fixing it means either having dispatcher.py
+        # import and validate against this setting at startup, or
+        # removing this setting and using dispatcher.supported_
+        # extensions() as the sole source of truth wherever a list
+        # of supported extensions is needed (e.g. the API layer).
+    )
+
+    # ------------------------------------------------------------------
+    # Job system (app/jobs/) - queueing and the background worker pool
+    # ------------------------------------------------------------------
+
+    MAX_QUEUED_JOBS_PER_USER: int = Field(
+        default=5,
+        ge=1,
+        # Renamed from MAX_UPLOADED_FILES_PER_SESSION (RFP-Analyzer-
+        # era naming). This caps how many reviews can be queued behind
+        # an in-progress one for a single user, enforced across ALL
+        # conversations that user has open - not a per-session limit.
+        # Actually enforced now (app/jobs/service.py's
+        # submit_review_job()) - this setting existed unused for a
+        # while before that wiring happened.
+    )
+
+    MAX_CONCURRENT_JOBS: int = Field(
+        default=3,
+        ge=1,
+        # How many worker slots (app/jobs/worker.py) run concurrently
+        # - a real, currently UNTUNED guess, same status as
+        # image_extraction.py's own max_concurrent. Bounds how many
+        # simultaneous review pipelines (each making real LLM calls)
+        # can hit the shared GenAI service at once.
+    )
+
+    POLL_INTERVAL_SECONDS: int = Field(
+        default=5,
+        ge=1,
+        # How often an idle worker slot re-checks for a new pending
+        # job.
+    )
+
+    STALE_JOB_THRESHOLD_SECONDS: int = Field(
+        default=900,
+        ge=1,
+        # A RUNNING job with no heartbeat this old gets requeued.
+        # Heartbeat currently only updates at phase boundaries
+        # (claimed/after-parse/after-review/completed), not
+        # mid-batch within a single long LLM call - keep this
+        # generous relative to real batch durations until that gets
+        # finer-grained. Untuned - needs real data from a 100MB-scale
+        # test run.
+    )
+
+    # ------------------------------------------------------------------
+    # Microsoft Graph (RESERVED - future knowledge-sync source
+    # registration, not yet built/used)
     # ------------------------------------------------------------------
 
     GRAPH_CLIENT_ID: str = ""
@@ -136,7 +267,10 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
-    # Microsoft Teams (Managed Identity auth)
+    # Microsoft Teams (RESERVED - future channel integration, not yet
+    # built; the REST API in app/api/v1/ is a dev/testing surface,
+    # NOT how Teams will ultimately connect - see architecture doc
+    # Section 1)
     # ------------------------------------------------------------------
 
     TEAMS_APP_ID: str = ""
@@ -146,7 +280,8 @@ class Settings(BaseSettings):
     TEAMS_SESSION_STALE_DAYS: int = 3
 
     # ------------------------------------------------------------------
-    # Chunking
+    # Chunking (RESERVED - future secondary vector-store Q&A feature,
+    # not yet built/used by the review engine)
     # ------------------------------------------------------------------
 
     CHUNK_SIZE_TOKENS: int = Field(
@@ -160,46 +295,6 @@ class Settings(BaseSettings):
         ge=0,
         le=10000,
     )
-
-    # ------------------------------------------------------------------
-    # Document intake / upload behaviour
-    # ------------------------------------------------------------------
-
-    MAX_FILE_SIZE_MB: int = Field(
-        default=100,
-        gt=0,
-        # 100MB is a confirmed, non-negotiable product requirement -
-        # see architecture doc Section 7. Not a guess.
-    )
-
-    SUPPORTED_FILE_EXTENSIONS: List[str] = Field(
-        default_factory=lambda: [".docx", ".pptx", ".xlsx", ".pdf"]
-        # ODP explicitly out of scope - confirmed in discovery phase.
-    )
-
-    MAX_QUEUED_JOBS_PER_USER: int = Field(
-        default=5,
-        ge=1,
-        # Renamed from MAX_UPLOADED_FILES_PER_SESSION (RFP-Analyzer-
-        # era naming). This caps how many reviews can be queued behind
-        # an in-progress one for a single user, enforced across ALL
-        # conversations that user has open - not a per-session limit.
-    )
-
-    AUTH_MODE: str = "header"          # or "entra" — new
-    # (ENTRA_TENANT_ID, AUTH_DEV_BYPASS, IS_PRODUCTION already required by your real entra.py)
-    POLL_INTERVAL_SECONDS: int = 5
-    STALE_JOB_THRESHOLD_SECONDS: int = 900
-    MAX_CONCURRENT_JOBS: int = 3
-
-    # ------------------------------------------------------------------
-    # Authentication
-    # ------------------------------------------------------------------
-
-    ENTRA_TENANT_ID: str
-
-    AUTH_DEV_BYPASS: bool = False
-    # never on in prod
 
     # ------------------------------------------------------------------
     # Feature flags
@@ -225,6 +320,15 @@ class Settings(BaseSettings):
         if self.IS_PRODUCTION and self.AUTH_DEV_BYPASS:
             raise ValueError(
                 "AUTH_DEV_BYPASS must be False in production"
+            )
+        # FIXED REAL ISSUE: ENTRA_TENANT_ID used to be unconditionally
+        # required (no default at all) - now only required when
+        # AUTH_MODE="entra" is actually selected, so AUTH_MODE="header"
+        # (the default) genuinely doesn't need any Entra config to
+        # start up.
+        if self.AUTH_MODE == "entra" and not self.ENTRA_TENANT_ID.strip():
+            raise ValueError(
+                "ENTRA_TENANT_ID is required when AUTH_MODE='entra'"
             )
         return self
 
