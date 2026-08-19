@@ -3,11 +3,14 @@ app/review/engine.py
 
 The single entry point tying together app/documents/ (parsing),
 app/rules/ (taxonomy), and this package's three rule runners into
-one function: review_document().
+one function: review_document(). This is the "review engine" as a
+standalone capability, callable independently of the conversational
+LangGraph shell - per the architecture doc's Section 2 principle.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from langchain_core.runnables import Runnable
@@ -38,11 +41,15 @@ async def review_document(
     judgment_model is the SHARED, UNBOUND GenAI client (from
     app.llm.get_genai_client) - both the judgment and consistency
     passes apply their own with_structured_output() on top of it
-    independently.
+    independently; this function does not pre-bind anything, so the
+    same underlying connection pool is reused across all LLM calls
+    in a review (see app/llm.py's reasoning on why a shared client
+    matters).
 
     applies_to determines which rule subset runs - GENERAL always;
     GENERAL+AUDIT only when the document was confirmed as an audit/
-    assurance proposal at intake.
+    assurance proposal at intake (see architecture doc Section 6 -
+    this is a real, user-answered decision, never auto-detected).
 
     is_pcs: FIXED REAL BUG - this parameter did not exist until now,
     meaning the entire PCS (Private Company Services) carve-out
@@ -58,8 +65,8 @@ async def review_document(
     english_variant defaults to US - matches the taxonomy's implicit
     default (built from a US-oriented style guide). Passing GLOBAL
     requires the caller to have actually asked the user at intake
-    which variant the document targets - nothing here infers it
-    automatically.
+    which variant the document targets (same pattern as applies_to) -
+    nothing here infers it automatically.
     """
 
     # FIXED REAL BUG: previously called rule_set.for_applies_to()
@@ -75,7 +82,10 @@ async def review_document(
     )
 
     # CONSISTENCY-category rules need the whole document, not one
-    # block at a time - routed to a structurally separate pass.
+    # block at a time - routed to a structurally separate pass, not
+    # folded into the per-block deterministic/judgment split. See
+    # app/review/consistency.py and the taxonomy fix that moved
+    # gram-capitalization-consistency out of a per-block category.
     consistency_rules = tuple(
         r for r in applicable_rules if r.category == RuleCategory.CONSISTENCY
     )
@@ -107,16 +117,45 @@ async def review_document(
 
     findings: list[Finding] = []
 
+    # Deterministic and lexical FIRST, always, cheap - both run
+    # regardless of what else happens, no LLM dependency.
     findings.extend(run_deterministic_rules(parsed.blocks, deterministic_rules))
     findings.extend(run_lexical_rules(parsed.blocks, lexical_rules))
 
-    findings.extend(
-        await run_judgment_rules(parsed.blocks, judgment_rules, judgment_model)
+    # Judgment and consistency run CONCURRENTLY, not sequentially -
+    # FIXED A REAL INEFFICIENCY: these are two fully independent
+    # operations (consistency doesn't need judgment's output or vice
+    # versa; both only read parsed.blocks, which is not mutated by
+    # either) sharing the same underlying GenAI client (already
+    # proven safe for concurrent use - judgment's own internal
+    # batches already share it concurrently, see judgment.py). There
+    # was no correctness reason for the previous sequential await -
+    # only unnecessary lost time, since consistency's real duration
+    # (~20-30s from real production data) was fully additive to the
+    # judgment pass's duration instead of overlapping it.
+    #
+    # return_exceptions=True as defense-in-depth: both
+    # run_judgment_rules() and run_consistency_pass() already catch
+    # their own internal failures and return [] rather than raising
+    # (confirmed by reading both), so this SHOULD never actually
+    # trigger - but an unexpected bug in either shouldn't be able to
+    # silently kill the other pass's already-good results, matching
+    # the resilience philosophy used everywhere else in this project.
+    judgment_result, consistency_result = await asyncio.gather(
+        run_judgment_rules(parsed.blocks, judgment_rules, judgment_model),
+        run_consistency_pass(parsed.blocks, consistency_rules, judgment_model),
+        return_exceptions=True,
     )
 
-    findings.extend(
-        await run_consistency_pass(parsed.blocks, consistency_rules, judgment_model)
-    )
+    if isinstance(judgment_result, BaseException):
+        logger.error("Judgment pass raised unexpectedly", exc_info=judgment_result)
+    else:
+        findings.extend(judgment_result)
+
+    if isinstance(consistency_result, BaseException):
+        logger.error("Consistency pass raised unexpectedly", exc_info=consistency_result)
+    else:
+        findings.extend(consistency_result)
 
     logger.info(
         "Review complete for %s: %d total findings",
