@@ -13,9 +13,10 @@ from app.database import connect_to_mongo, close_mongo_connection
 from app.checkpointer import connect_checkpointer, close_checkpointer
 from app.utils.error_handlers import register_error_handlers
 from app.utils.access_log_filter import configure_access_log_filter
-from app.api.v1.router import router
 from app.llm import connect_genai, close_genai
 from app.jobs.worker import start_worker, stop_worker
+
+from app.api.v1.router import router
 
 
 logger = logging.getLogger(__name__)
@@ -26,7 +27,6 @@ configure_access_log_filter()
 # - Guarded cleanup helpers (module-level, shared by startup-abort and
 #   shutdown paths). Each step is independently guarded so one failure
 #   can't mask the original error or skip the remaining cleanups.
-
 async def _safe_async(name: str, coro) -> None:
     try:
         await coro
@@ -56,10 +56,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # - Checkpointer. Construction is blocking (index creation), so
         #   run it off the event loop.
         await asyncio.to_thread(connect_checkpointer, app)
+
         connect_genai(app)  # cheap/non-blocking, no need for to_thread
 
+        # start worker
         start_worker(app)
-
 
         app.state.ready = True
         logger.info("%s startup complete", settings.AGENT_NAME)
@@ -71,40 +72,56 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         )
 
         # Best-effort cleanup of whatever partially came up.
-
         await _safe_async(
             "worker",
-            stop_worker(app)
+            stop_worker(app),
         )
+
         _safe_sync(
             "checkpointer",
             lambda: close_checkpointer(app),
         )
+
         await _safe_async(
             "mongo",
             close_mongo_connection(app),
         )
-        await _safe_async("genai", close_genai(app))
+
+        await _safe_async(
+            "genai",
+            close_genai(app),
+        )
 
         raise
 
     yield
 
-    logger.info("Shutting down %s...", settings.AGENT_NAME)
+    logger.info(
+        "Shutting down %s...",
+        settings.AGENT_NAME,
+    )
+
     app.state.ready = False
 
     # Symmetric with startup-abort cleanup above.
     await _safe_async(
         "worker",
-        stop_worker(app)
+        stop_worker(app),
     )
+
     _safe_sync(
         "checkpointer",
         lambda: close_checkpointer(app),
     )
+
     await _safe_async(
         "mongo",
         close_mongo_connection(app),
+    )
+
+    await _safe_async(
+        "genai",
+        close_genai(app),
     )
 
     logger.info(
@@ -115,15 +132,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
 def create_app() -> FastAPI:
     """
-    Application factory - builds and returns the configured FastAPI
+    Application factory — builds and returns the configured FastAPI
     instance. Called by uvicorn in root main.py; also called in tests to
     get a fresh app per test run.
     """
 
-    enable_docs = (
-        settings.ENABLE_SWAGGER
-        and not settings.IS_PRODUCTION
-    )
+    enable_docs = settings.ENABLE_SWAGGER and not settings.IS_PRODUCTION
 
     app = FastAPI(
         title=settings.AGENT_NAME,

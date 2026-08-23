@@ -43,7 +43,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from pymongo.asynchronous.database import AsyncDatabase
 
 from app.auth.dependencies import get_current_user_id
-from app.api.v1.schemas import JobStatusResponse, SubmitReviewResponse
+from app.schema.document import SubmitReviewResponse, JobStatusResponse
 from app.config import settings
 from app.documents.dispatcher import _extension_of, supported_extensions
 from app.jobs import repository
