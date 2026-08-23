@@ -20,31 +20,30 @@ logic lives in app/jobs/service.py rather than in these route
 handlers: both this REST surface and the future Teams shell can call
 the same underlying functions without duplicating logic between them.
 
-AUTH: see app/api/v1/auth.py - get_current_user_id() supports TWO
+AUTH: see app/auth/dependencies.py - get_current_user_id() supports TWO
 real modes (settings.AUTH_MODE = "header" or "entra"), not one
 placeholder and one guess. Defaults to "header", matching the
 confirmed reality that Entra auth wasn't implemented in the first
 app this pattern is modeled on.
 
-DB DEPENDENCY: get_db() reads request.app.state.mongo_db - matches
-the established app.state wiring pattern used throughout this build
-(app.state.genai_client, app.state.mongo_db already set by
-connect_to_mongo()/connect_genai() in main.py's lifespan). If
-app/database.py already exposes its own FastAPI dependency for this
-exact purpose, prefer that one over this file's - not confirmed
-either way since this agent hasn't seen that file's current content.
+DB DEPENDENCY: uses the real, existing app/database.py's
+get_database() - not reimplemented here. Previously this file
+defined its own local get_db() reading request.app.state.mongo_db
+directly, duplicating logic that already existed correctly - fixed
+once the real app/database.py was available.
 """
 
 from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pymongo.asynchronous.database import AsyncDatabase
 
 from app.auth.dependencies import get_current_user_id
-from app.schema.document import SubmitReviewResponse, JobStatusResponse
+from app.api.v1.schemas import JobStatusResponse, SubmitReviewResponse
 from app.config import settings
+from app.database import get_database
 from app.documents.dispatcher import _extension_of, supported_extensions
 from app.jobs import repository
 from app.jobs.findings_repository import get_findings_for_job
@@ -56,10 +55,6 @@ logger = logging.getLogger("app.api.v1.documents")
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 
-def get_db(request: Request) -> AsyncDatabase:
-    return request.app.state.mongo_db
-
-
 @router.post("/review", response_model=SubmitReviewResponse, status_code=202)
 async def submit_review(
     file: UploadFile = File(...),
@@ -67,7 +62,7 @@ async def submit_review(
     is_pcs: bool = Form(False),
     english_variant: EnglishVariant = Form(EnglishVariant.US),
     user_id: str = Depends(get_current_user_id),
-    db: AsyncDatabase = Depends(get_db),
+    db: AsyncDatabase = Depends(get_database),
 ) -> SubmitReviewResponse:
     """Submits a document for background review. Returns 202
     (Accepted) - the review has NOT run yet, only been queued; poll
@@ -85,36 +80,17 @@ async def submit_review(
         raise HTTPException(status_code=400, detail="No filename provided")
 
     ext = _extension_of(file.filename)
-    # Using dispatcher's own private _extension_of rather than
-    # duplicating its (trivial but easy to drift) logic here -
-    # supported_extensions()'s own docstring explicitly invites
-    # exactly this use, and reusing the SAME extension-parsing logic
-    # the dispatcher itself uses avoids a subtle mismatch (e.g. this
-    # route accepting a filename the dispatcher would then reject
-    # anyway due to a slightly different extension-parsing rule).
     if ext not in supported_extensions():
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported file type '{ext}' - supported: {', '.join(supported_extensions())}",
         )
-    # Cheap, immediate rejection for an unsupported type BEFORE
-    # queueing a job that would just fail later in the worker with
-    # the same UnsupportedFileTypeError - better UX (instant
-    # feedback), and doesn't waste a worker slot on a submission
-    # that could never succeed.
 
     if file.size is not None and file.size > settings.MAX_FILE_SIZE_MB * 1024 * 1024:
         raise HTTPException(
             status_code=413,
             detail=f"File exceeds the {settings.MAX_FILE_SIZE_MB}MB limit ({file.size / 1024 / 1024:.1f}MB)",
         )
-    # file.size is populated by Starlette's multipart parser before
-    # this function body runs (confirmed via direct test against a
-    # real request, not assumed) - this is a cheap pre-check before
-    # our own full .read(). The AUTHORITATIVE size check still
-    # happens downstream in the dispatcher (based on actual bytes
-    # read, not a client-reported size that could be wrong/absent) -
-    # this is a first-line convenience check, not the only one.
 
     file_bytes = await file.read()
 
@@ -150,7 +126,7 @@ async def submit_review(
 async def get_review_status(
     job_id: str,
     user_id: str = Depends(get_current_user_id),
-    db: AsyncDatabase = Depends(get_db),
+    db: AsyncDatabase = Depends(get_database),
 ) -> JobStatusResponse:
     """Status + findings (once complete) for a previously submitted
     review. Returns 404 for a job that doesn't exist OR belongs to a
@@ -162,9 +138,6 @@ async def get_review_status(
     try:
         job = await repository.get_job(db, job_id)
     except Exception:
-        # Malformed job_id (not a valid ObjectId) - same 404 as
-        # "doesn't exist", not a 400/500 that would distinguish
-        # "malformed" from "well-formed but absent" to the caller.
         job = None
 
     if job is None or job.user_id != user_id:
