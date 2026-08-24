@@ -1,24 +1,24 @@
 """
 app/jobs/service.py
 
-The submission entry point - what a future API route (not yet built)
-should call to enqueue a review, rather than talking to storage.py/
-repository.py directly. Ties together:
-- MAX_QUEUED_JOBS_PER_USER enforcement (a config setting that existed
-  since early in this build but was never actually wired to anything
-  until now)
-- GridFS storage of the raw upload
-- Job record creation
+Job submission. Two entry points sharing one internal record-creation
+path:
 
-Deliberately does NOT reject or block a second submission just
-because the user already has an active job - it QUEUES it (matches
-the confirmed design: FIFO processing via claim_next_pending_job's
-sort by created_at naturally handles this, no separate scheduling
-logic needed). The return value tells the caller whether the user
-already had one active, so a future conversational layer can inform
-them ("I'll queue this behind your current review") - deciding
-whether to surface that, and any "replace instead?" UX, belongs to
-that future layer, not this one.
+- submit_review_job() - the ORIGINAL, unchanged-signature path used
+  by the REST /documents/review route (single-shot: file bytes +
+  all intake answers arrive together, no staging needed - that
+  route was never subject to the checkpointed-state problem Phase 1
+  fixes, since it doesn't go through the graph at all).
+
+- create_job_from_staged_upload() - Phase 1 addition, used by the
+  chat flow once intake is complete. Takes an EXISTING gridfs_file_id
+  from a prior stage_upload() call rather than raw bytes, so the
+  file is genuinely uploaded ONCE - confirmed real requirement from
+  the architecture doc ("File is not uploaded twice").
+
+Both call the same private _create_job_record() for the actual
+active-job-count check and ReviewJob creation, so this logic can't
+drift between the two paths.
 """
 
 from __future__ import annotations
@@ -47,9 +47,33 @@ class TooManyQueuedJobsError(Exception):
 class SubmissionResult:
     job_id: str
     had_existing_active_job: bool
-    # True if the user already had a PENDING/RUNNING job before this
-    # one was created - signal for a future caller to mention
-    # queueing, not acted on here.
+
+
+async def _create_job_record(
+    db: AsyncDatabase,
+    user_id: str,
+    gridfs_file_id: str,
+    filename: str,
+    file_size_bytes: int,
+    max_queued_jobs_per_user: int,
+    applies_to: AppliesTo,
+    is_pcs: bool,
+    english_variant: EnglishVariant,
+) -> SubmissionResult:
+    active_count = await repository.count_active_jobs_for_user(db, user_id)
+    if active_count >= max_queued_jobs_per_user:
+        raise TooManyQueuedJobsError(user_id, max_queued_jobs_per_user)
+
+    had_existing = active_count > 0
+
+    job = ReviewJob(
+        user_id=user_id, filename=filename, file_size_bytes=file_size_bytes,
+        gridfs_file_id=gridfs_file_id, applies_to=applies_to, is_pcs=is_pcs,
+        english_variant=english_variant,
+    )
+    job_id = await repository.create_job(db, job)
+
+    return SubmissionResult(job_id=job_id, had_existing_active_job=had_existing)
 
 
 async def submit_review_job(
@@ -62,29 +86,35 @@ async def submit_review_job(
     is_pcs: bool = False,
     english_variant: EnglishVariant = EnglishVariant.US,
 ) -> SubmissionResult:
-    """Raises TooManyQueuedJobsError if the user is already at their
-    queue limit - this is a real, enforced cap, not just a config
-    value sitting unused (confirmed: MAX_QUEUED_JOBS_PER_USER existed
-    in config.py since early in this build with nothing checking it
-    until this function)."""
-
-    active_count = await repository.count_active_jobs_for_user(db, user_id)
-    if active_count >= max_queued_jobs_per_user:
-        raise TooManyQueuedJobsError(user_id, max_queued_jobs_per_user)
-
-    had_existing = active_count > 0
+    """Unchanged signature/behavior - the REST route's single-shot
+    submission path. Stores the file itself; use
+    create_job_from_staged_upload() instead when the file was already
+    staged (the chat flow's path, post-Phase-1)."""
 
     gridfs_file_id = await store_file(db, file_bytes, filename)
-
-    job = ReviewJob(
-        user_id=user_id,
-        filename=filename,
-        file_size_bytes=len(file_bytes),
-        gridfs_file_id=gridfs_file_id,
-        applies_to=applies_to,
-        is_pcs=is_pcs,
-        english_variant=english_variant,
+    return await _create_job_record(
+        db, user_id, gridfs_file_id, filename, len(file_bytes),
+        max_queued_jobs_per_user, applies_to, is_pcs, english_variant,
     )
-    job_id = await repository.create_job(db, job)
 
-    return SubmissionResult(job_id=job_id, had_existing_active_job=had_existing)
+
+async def create_job_from_staged_upload(
+    db: AsyncDatabase,
+    user_id: str,
+    gridfs_file_id: str,
+    filename: str,
+    file_size_bytes: int,
+    max_queued_jobs_per_user: int,
+    applies_to: AppliesTo = AppliesTo.GENERAL,
+    is_pcs: bool = False,
+    english_variant: EnglishVariant = EnglishVariant.US,
+) -> SubmissionResult:
+    """Phase 1 addition - does NOT call store_file(), since the bytes
+    are already in GridFS from an earlier stage_upload() call. Caller
+    (app/agent/nodes/submit_document.py) is responsible for marking
+    the staged upload consumed after this succeeds."""
+
+    return await _create_job_record(
+        db, user_id, gridfs_file_id, filename, file_size_bytes,
+        max_queued_jobs_per_user, applies_to, is_pcs, english_variant,
+    )

@@ -46,6 +46,8 @@ def _api_url(path: str) -> str:
 
 
 def _auth_headers() -> dict:
+    # Matches AUTH_MODE="header" (the confirmed default) - see
+    # app/auth/dependencies.py.
     return {"X-User-Id": st.session_state.user_id}
 
 
@@ -121,8 +123,8 @@ if prompt:
 
         if resp.status_code == 200:
             body = resp.json()
-            st.session_state.session_id = body["session_id"]
-            reply = body["reply"]
+            st.session_state.session_id = body["conversation_id"]
+            reply = body["text"]
             st.write(reply)
             st.session_state.history.append({"role": "assistant", "content": reply, "filename": None})
         elif resp.status_code in (400, 413):

@@ -57,6 +57,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         #   run it off the event loop.
         await asyncio.to_thread(connect_checkpointer, app)
 
+        from app.agent.graph import build_graph
+        app.state.chat_graph = build_graph(app.state.checkpointer)
+
         connect_genai(app)  # cheap/non-blocking, no need for to_thread
 
         # start worker
