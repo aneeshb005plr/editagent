@@ -34,7 +34,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from pymongo.asynchronous.database import AsyncDatabase
 
-from app.api.v1.chat_schemas import ChatMessageResponse
+from app.schema.chat import ChatMessageResponse
 from app.auth.dependencies import get_current_user_id
 from app.checkpointer import get_checkpointer
 from app.database import get_database
