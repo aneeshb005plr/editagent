@@ -1,38 +1,41 @@
 """
 app/jobs/service.py
 
-FIXED REAL REGRESSION, confirmed via direct reproduction and via
-external review: submit_review_job() previously called store_file()
-BEFORE the queue-capacity check (introduced when Phase 1 refactored
-this to share code with create_job_from_staged_upload) - meaning a
-user already at their queue limit still got a real file uploaded to
-GridFS that then sat orphaned forever, since TooManyQueuedJobsError
-was only raised AFTER the upload succeeded. Confirmed by direct test:
-filled a user's queue, submitted, watched the file land in storage
-anyway despite the rejection. The claim "unchanged behavior" in the
-prior version of this file's docstring was WRONG - this function's
-docstring is corrected below, and the fix restores the ORIGINAL
-pre-Phase-1 order (check capacity, THEN store).
+FIX for external review point 3: submit_review_job() (REST path) now
+compensates (deletes the just-uploaded GridFS file) if
+repository.create_job() fails AFTER store_file() succeeded - closes
+the exact same class of orphan window already fixed for
+stage_upload() (app/services/upload_service.py) and for the
+queue-capacity-check ordering (both from the previous hardening
+pass), just at one more point in the same function.
 
-IDEMPOTENCY FIX, per external review: create_job_from_staged_upload()
-now checks for an existing job tied to the same source_upload_id
-before creating a new one - a retry after a partial failure (job
-created, then mark_consumed() fails, caller retries) returns the
-existing job instead of creating a second one pointing at the same
-GridFS file (which would leave one job's eventual GridFS cleanup
-breaking the other job that still needs the same file).
+FIX for external review point 2: create_job_from_staged_upload()'s
+application-level "check then create" is only a fast-path
+optimization now, NOT the actual idempotency guarantee - the REAL
+guarantee is the partial unique index on source_upload_id
+(repository.ensure_indexes()) plus catching the resulting
+DuplicateKeyError here and resolving to the existing job. Two
+concurrent calls for the same staged upload can both pass the
+application-level pre-check (a genuine race, the same class the
+external review flagged), but only one insert can actually succeed
+at the database level - the loser catches DuplicateKeyError and
+returns the winner's job instead of erroring.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from pymongo.asynchronous.database import AsyncDatabase
+from pymongo.errors import DuplicateKeyError
 
 from app.jobs import repository
 from app.jobs.schema import ReviewJob
-from app.jobs.storage import store_file
+from app.jobs.storage import delete_file, store_file
 from app.rules.schema import AppliesTo, EnglishVariant
+
+logger = logging.getLogger("app.jobs.service")
 
 
 class TooManyQueuedJobsError(Exception):
@@ -52,11 +55,6 @@ class SubmissionResult:
 
 
 async def _check_queue_capacity(db: AsyncDatabase, user_id: str, max_queued_jobs_per_user: int) -> bool:
-    """Returns had_existing_active_job. Raises TooManyQueuedJobsError
-    if at capacity. Deliberately a separate, explicit step BOTH
-    submission paths call FIRST, before acquiring/referencing any
-    file - so a rejection never has a chance to orphan anything."""
-
     active_count = await repository.count_active_jobs_for_user(db, user_id)
     if active_count >= max_queued_jobs_per_user:
         raise TooManyQueuedJobsError(user_id, max_queued_jobs_per_user)
@@ -73,12 +71,6 @@ async def submit_review_job(
     is_pcs: bool = False,
     english_variant: EnglishVariant = EnglishVariant.US,
 ) -> SubmissionResult:
-    """The REST route's single-shot submission path. FIXED ORDER:
-    capacity check happens BEFORE store_file() - a rejected
-    submission never uploads anything, matching the original
-    pre-Phase-1 behavior (confirmed via direct test, not just
-    asserted)."""
-
     had_existing = await _check_queue_capacity(db, user_id, max_queued_jobs_per_user)
 
     gridfs_file_id = await store_file(db, file_bytes, filename)
@@ -88,7 +80,14 @@ async def submit_review_job(
         gridfs_file_id=gridfs_file_id, applies_to=applies_to, is_pcs=is_pcs,
         english_variant=english_variant,
     )
-    job_id = await repository.create_job(db, job)
+    try:
+        job_id = await repository.create_job(db, job)
+    except Exception:
+        # FIX for external review point 3 - compensate rather than
+        # leave an orphaned GridFS object with nothing tracking it.
+        logger.error("Job record creation failed after GridFS upload succeeded - compensating", exc_info=True)
+        await delete_file(db, gridfs_file_id)
+        raise
 
     return SubmissionResult(job_id=job_id, had_existing_active_job=had_existing)
 
@@ -105,18 +104,9 @@ async def create_job_from_staged_upload(
     english_variant: EnglishVariant = EnglishVariant.US,
     source_upload_id: str | None = None,
 ) -> SubmissionResult:
-    """Chat flow's path - the file is already in GridFS from an
-    earlier stage_upload() call. IDEMPOTENT when source_upload_id is
-    provided: checks for an already-created job FIRST, before
-    touching queue capacity at all - a retry for the same staged
-    upload returns the existing job rather than creating a
-    duplicate."""
-
     if source_upload_id:
         existing = await repository.get_job_by_source_upload_id(db, source_upload_id)
         if existing is not None:
-            # Retry of an already-completed submission - return the
-            # existing job, don't re-check capacity or create anything.
             existing_job_id, _ = existing
             return SubmissionResult(job_id=existing_job_id, had_existing_active_job=False)
 
@@ -127,6 +117,20 @@ async def create_job_from_staged_upload(
         gridfs_file_id=gridfs_file_id, applies_to=applies_to, is_pcs=is_pcs,
         english_variant=english_variant, source_upload_id=source_upload_id,
     )
-    job_id = await repository.create_job(db, job)
+
+    try:
+        job_id = await repository.create_job(db, job)
+    except DuplicateKeyError:
+        # FIX for external review point 2: lost a genuine race - a
+        # concurrent call for the SAME source_upload_id won. The
+        # database-level unique index (repository.ensure_indexes())
+        # is what actually guarantees this can happen to at most one
+        # loser, not the application-level pre-check above (which is
+        # only a fast-path optimization, not the real guarantee).
+        existing = await repository.get_job_by_source_upload_id(db, source_upload_id)
+        if existing is not None:
+            existing_job_id, _ = existing
+            return SubmissionResult(job_id=existing_job_id, had_existing_active_job=False)
+        raise  # shouldn't happen - a duplicate key means it must exist
 
     return SubmissionResult(job_id=job_id, had_existing_active_job=had_existing)

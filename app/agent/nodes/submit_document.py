@@ -72,7 +72,14 @@ async def handle_submit_document_node(state: ChatState, runtime: Runtime[ChatCon
             update={"messages": [AIMessage(content="I don't see a file attached yet - please upload a document to review.")]},
         )
 
-    answers = state.get("intake_answers") or {"applies_to": None, "is_pcs": None, "english_variant": None}
+    answers = dict(state.get("intake_answers") or {"applies_to": None, "is_pcs": None, "english_variant": None})
+    # FIX for external review point 6: copy the dict rather than
+    # mutate the object read from state in place. state.get(...)
+    # returns a reference to whatever's checkpointed - mutating it
+    # directly risks unpredictable checkpoint/replay behavior (the
+    # same class of concern LangGraph's own reducer pattern exists to
+    # avoid) even though this specific code path happened to behave
+    # correctly in testing. A fresh copy is unambiguously safe.
 
     resume = interrupt({"text": _intake_question_text(answers)})
 

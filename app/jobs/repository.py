@@ -78,3 +78,35 @@ async def get_job_by_source_upload_id(db, source_upload_id: str):
         return None
     job_id = str(doc["_id"])
     return job_id, _to_job(doc)
+
+
+async def ensure_indexes(db) -> None:
+    """FIX for external review point 2: the application-level
+    get_job_by_source_upload_id() "check, then create" pattern is
+    only a best-effort check - two concurrent calls can both see "no
+    existing job" and both create one. A partial unique index makes
+    the guarantee REAL: MongoDB itself rejects the second insert. See
+    create_job_from_staged_upload() in app/jobs/service.py for how
+    the resulting DuplicateKeyError is handled (resolves to the
+    existing job, not treated as an error).
+
+    CAUGHT A REAL BUG BEFORE THIS EVER RAN: the partial filter uses
+    {"$type": "string"}, NOT {"$exists": True}. Confirmed via direct
+    test that Pydantic's model_dump() includes source_upload_id=None
+    for every REST-path job (Pydantic includes all fields by default,
+    not just set ones) - and MongoDB's $exists: true matches a field
+    that's PRESENT even when its value is null. Using $exists would
+    have applied the unique constraint to every REST job's null
+    value too, breaking every REST submission after the first with a
+    spurious duplicate-key error. $type: "string" correctly matches
+    only real, non-null source_upload_id values.
+
+    Not yet wired into a startup hook - call this once during app
+    startup (e.g. alongside other index-creation calls, if any exist
+    elsewhere in this codebase's lifespan)."""
+
+    await db[_COLLECTION].create_index(
+        "source_upload_id",
+        unique=True,
+        partialFilterExpression={"source_upload_id": {"$type": "string"}},
+    )
