@@ -1,24 +1,26 @@
 """
 app/jobs/service.py
 
-Job submission. Two entry points sharing one internal record-creation
-path:
+FIXED REAL REGRESSION, confirmed via direct reproduction and via
+external review: submit_review_job() previously called store_file()
+BEFORE the queue-capacity check (introduced when Phase 1 refactored
+this to share code with create_job_from_staged_upload) - meaning a
+user already at their queue limit still got a real file uploaded to
+GridFS that then sat orphaned forever, since TooManyQueuedJobsError
+was only raised AFTER the upload succeeded. Confirmed by direct test:
+filled a user's queue, submitted, watched the file land in storage
+anyway despite the rejection. The claim "unchanged behavior" in the
+prior version of this file's docstring was WRONG - this function's
+docstring is corrected below, and the fix restores the ORIGINAL
+pre-Phase-1 order (check capacity, THEN store).
 
-- submit_review_job() - the ORIGINAL, unchanged-signature path used
-  by the REST /documents/review route (single-shot: file bytes +
-  all intake answers arrive together, no staging needed - that
-  route was never subject to the checkpointed-state problem Phase 1
-  fixes, since it doesn't go through the graph at all).
-
-- create_job_from_staged_upload() - Phase 1 addition, used by the
-  chat flow once intake is complete. Takes an EXISTING gridfs_file_id
-  from a prior stage_upload() call rather than raw bytes, so the
-  file is genuinely uploaded ONCE - confirmed real requirement from
-  the architecture doc ("File is not uploaded twice").
-
-Both call the same private _create_job_record() for the actual
-active-job-count check and ReviewJob creation, so this logic can't
-drift between the two paths.
+IDEMPOTENCY FIX, per external review: create_job_from_staged_upload()
+now checks for an existing job tied to the same source_upload_id
+before creating a new one - a retry after a partial failure (job
+created, then mark_consumed() fails, caller retries) returns the
+existing job instead of creating a second one pointing at the same
+GridFS file (which would leave one job's eventual GridFS cleanup
+breaking the other job that still needs the same file).
 """
 
 from __future__ import annotations
@@ -49,31 +51,16 @@ class SubmissionResult:
     had_existing_active_job: bool
 
 
-async def _create_job_record(
-    db: AsyncDatabase,
-    user_id: str,
-    gridfs_file_id: str,
-    filename: str,
-    file_size_bytes: int,
-    max_queued_jobs_per_user: int,
-    applies_to: AppliesTo,
-    is_pcs: bool,
-    english_variant: EnglishVariant,
-) -> SubmissionResult:
+async def _check_queue_capacity(db: AsyncDatabase, user_id: str, max_queued_jobs_per_user: int) -> bool:
+    """Returns had_existing_active_job. Raises TooManyQueuedJobsError
+    if at capacity. Deliberately a separate, explicit step BOTH
+    submission paths call FIRST, before acquiring/referencing any
+    file - so a rejection never has a chance to orphan anything."""
+
     active_count = await repository.count_active_jobs_for_user(db, user_id)
     if active_count >= max_queued_jobs_per_user:
         raise TooManyQueuedJobsError(user_id, max_queued_jobs_per_user)
-
-    had_existing = active_count > 0
-
-    job = ReviewJob(
-        user_id=user_id, filename=filename, file_size_bytes=file_size_bytes,
-        gridfs_file_id=gridfs_file_id, applies_to=applies_to, is_pcs=is_pcs,
-        english_variant=english_variant,
-    )
-    job_id = await repository.create_job(db, job)
-
-    return SubmissionResult(job_id=job_id, had_existing_active_job=had_existing)
+    return active_count > 0
 
 
 async def submit_review_job(
@@ -86,16 +73,24 @@ async def submit_review_job(
     is_pcs: bool = False,
     english_variant: EnglishVariant = EnglishVariant.US,
 ) -> SubmissionResult:
-    """Unchanged signature/behavior - the REST route's single-shot
-    submission path. Stores the file itself; use
-    create_job_from_staged_upload() instead when the file was already
-    staged (the chat flow's path, post-Phase-1)."""
+    """The REST route's single-shot submission path. FIXED ORDER:
+    capacity check happens BEFORE store_file() - a rejected
+    submission never uploads anything, matching the original
+    pre-Phase-1 behavior (confirmed via direct test, not just
+    asserted)."""
+
+    had_existing = await _check_queue_capacity(db, user_id, max_queued_jobs_per_user)
 
     gridfs_file_id = await store_file(db, file_bytes, filename)
-    return await _create_job_record(
-        db, user_id, gridfs_file_id, filename, len(file_bytes),
-        max_queued_jobs_per_user, applies_to, is_pcs, english_variant,
+
+    job = ReviewJob(
+        user_id=user_id, filename=filename, file_size_bytes=len(file_bytes),
+        gridfs_file_id=gridfs_file_id, applies_to=applies_to, is_pcs=is_pcs,
+        english_variant=english_variant,
     )
+    job_id = await repository.create_job(db, job)
+
+    return SubmissionResult(job_id=job_id, had_existing_active_job=had_existing)
 
 
 async def create_job_from_staged_upload(
@@ -108,13 +103,30 @@ async def create_job_from_staged_upload(
     applies_to: AppliesTo = AppliesTo.GENERAL,
     is_pcs: bool = False,
     english_variant: EnglishVariant = EnglishVariant.US,
+    source_upload_id: str | None = None,
 ) -> SubmissionResult:
-    """Phase 1 addition - does NOT call store_file(), since the bytes
-    are already in GridFS from an earlier stage_upload() call. Caller
-    (app/agent/nodes/submit_document.py) is responsible for marking
-    the staged upload consumed after this succeeds."""
+    """Chat flow's path - the file is already in GridFS from an
+    earlier stage_upload() call. IDEMPOTENT when source_upload_id is
+    provided: checks for an already-created job FIRST, before
+    touching queue capacity at all - a retry for the same staged
+    upload returns the existing job rather than creating a
+    duplicate."""
 
-    return await _create_job_record(
-        db, user_id, gridfs_file_id, filename, file_size_bytes,
-        max_queued_jobs_per_user, applies_to, is_pcs, english_variant,
+    if source_upload_id:
+        existing = await repository.get_job_by_source_upload_id(db, source_upload_id)
+        if existing is not None:
+            # Retry of an already-completed submission - return the
+            # existing job, don't re-check capacity or create anything.
+            existing_job_id, _ = existing
+            return SubmissionResult(job_id=existing_job_id, had_existing_active_job=False)
+
+    had_existing = await _check_queue_capacity(db, user_id, max_queued_jobs_per_user)
+
+    job = ReviewJob(
+        user_id=user_id, filename=filename, file_size_bytes=file_size_bytes,
+        gridfs_file_id=gridfs_file_id, applies_to=applies_to, is_pcs=is_pcs,
+        english_variant=english_variant, source_upload_id=source_upload_id,
     )
+    job_id = await repository.create_job(db, job)
+
+    return SubmissionResult(job_id=job_id, had_existing_active_job=had_existing)

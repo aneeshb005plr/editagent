@@ -1,24 +1,14 @@
 """
-app/schemas/staged_upload.py
+app/schema/staged_upload.py
 
-Phase 1 of the chat architecture plan: large file bytes must never
-live in checkpointed LangGraph state. MongoDB has a hard 16MB BSON
-document size limit; ChatState is exactly what MongoDBSaver writes
-into the checkpoint collection every turn - and this project's own
-stated requirement is up to 100MB files. Without staging, intake
-would not just be inefficient, it would outright fail for any file
-over ~16MB. This is the real, load-bearing fix Phase 1 exists for.
-
-A staged upload is a short-lived record: bytes go into GridFS
-immediately (reusing app/jobs/storage.py's existing store_file/
-retrieve_file/delete_file - already generic, not coupled to "review
-job" specifically, so no duplicated GridFS logic here), and only a
-small upload_id reference travels through ChatState from then on.
+See app/services/upload_service.py for the compensation logic
+(point 6 of external review) and the expiry/cleanup mechanism
+(point 9) built on top of expires_at below.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 from pydantic import BaseModel, Field
@@ -34,6 +24,10 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _default_expiry() -> datetime:
+    return _utcnow() + timedelta(hours=24)
+
+
 class StagedUpload(BaseModel):
     user_id: str
     gridfs_file_id: str
@@ -44,3 +38,11 @@ class StagedUpload(BaseModel):
     consumed_job_id: str | None = None
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
+    expires_at: datetime = Field(default_factory=_default_expiry)
+    # FIX for external review point 9: a real, previously-missing gap
+    # - a user who attaches a file, starts intake, then closes the
+    # browser and never returns had NO cleanup path at all (only
+    # explicit replacement and explicit failed-job-creation were
+    # handled). 24h is a reasonable, untuned default - matches this
+    # project's established pattern of flagging untuned defaults
+    # rather than pretending a number is final.

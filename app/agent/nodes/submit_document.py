@@ -1,45 +1,40 @@
 """
 app/agent/nodes/submit_document.py
 
-PHASE 2 REWORK: intake is now driven by LangGraph's native
-interrupt()/Command(resume=...) mechanism, confirmed via direct
-testing against our real installed langgraph before this was built
-(not assumed from the architecture doc's description alone).
+REBUILT twice in this session - first per external review points 1-4
+(one interrupt() per invocation, state-persisted answers), then a
+SECOND real fix found via direct testing of THAT rebuild: routing
+was decided by a separate conditional-edge function (_route_intake
+in graph.py) inferring "should we loop back?" from whether
+intake_answers looked complete - but this couldn't distinguish
+"cancelled, stop" from "still incomplete, keep asking", since both
+states have intake_answers that isn't "complete". Reproduced directly:
+a cancel correctly cleared intake_answers, but the routing function
+then looped back to this SAME node forever (confirmed hang via a
+call-count safety limit in testing, not just theorized).
 
-CRITICAL DESIGN POINT, confirmed by direct measurement before
-writing this: only the interrupt() call itself is memoized on
-replay - any code between two interrupt() calls in a loop
-RE-EXECUTES on every subsequent resume (confirmed: a stand-in
-"expensive_parse" call fired 3 times for only 2 real user answers
-across a 2-question loop, when parsing lived inside the loop). This
-means the LLM-based IntakeAnswers parsing MUST NOT happen inside
-this node's loop - it happens exactly once, in app/services/
-chat_service.py, BEFORE resuming, and only the already-parsed result
-crosses into the resume payload. Everything inside this node's loop
-is now cheap, side-effect-free dict merging - safe to re-execute on
-every replay, which is what "Intake reply is parsed once" actually
-requires.
-
-Handles BOTH submit_document and new_document intents. A file
-attached WHILE mid-intake (via the resume payload's new_upload_id)
-triggers the same replacement/cleanup as Phase 1 - the old staged
-upload is abandoned, intake restarts for the new file.
+FIXED by having this node return Command(goto=...) directly - node-
+controlled routing, confirmed via isolated test against our real
+installed langgraph to require no separate conditional-edge function
+at all. Now there is no ambiguous state to misinterpret: cancel goes
+to END explicitly, completion goes to create_review_job explicitly,
+"still incomplete" goes back to this node explicitly - three
+genuinely distinct routing decisions, not one heuristic inferring
+between them.
 """
 
 from __future__ import annotations
 
 import logging
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langgraph.graph import END
 from langgraph.runtime import Runtime
-from langgraph.types import interrupt
+from langgraph.types import Command, interrupt
 
 from app.agent.context import ChatContext
+from app.agent.models import IntakeInterpretation
 from app.agent.state import ChatState
-from app.config import settings
-from app.jobs.service import TooManyQueuedJobsError, create_job_from_staged_upload
-from app.repository.staged_upload_repository import get_staged_upload, mark_consumed
-from app.rules.schema import AppliesTo, EnglishVariant
 from app.services.upload_service import abandon_staged_upload
 
 logger = logging.getLogger("app.agent.nodes.submit_document")
@@ -66,92 +61,87 @@ def _intake_complete(answers: dict) -> bool:
     return True
 
 
-async def handle_submit_document_node(state: ChatState, runtime: Runtime[ChatContext]) -> dict:
+async def handle_submit_document_node(state: ChatState, runtime: Runtime[ChatContext]) -> Command:
     db = runtime.context["db"]
-    user_id = runtime.context["user_id"]
+    genai_client = runtime.context["genai_client"]
 
     upload_id = state.get("pending_upload_id")
-    filename = state.get("pending_filename")
-    size_bytes = state.get("pending_file_size_bytes")
-    content_type = state.get("pending_content_type")
-
     if not upload_id:
-        return {"messages": [AIMessage(content="I don't see a file attached yet - please upload a document to review.")]}
-
-    answers: dict = {"applies_to": None, "is_pcs": None, "english_variant": None}
-
-    while not _intake_complete(answers):
-        resume = interrupt({"text": _intake_question_text(answers)})
-        # resume is a plain dict built by chat_service.py - see that
-        # module's docstring. Everything below is cheap dict merging,
-        # deliberately no LLM calls or other real side effects, since
-        # this whole block re-executes on every subsequent resume
-        # (confirmed via direct measurement - see module docstring).
-
-        new_upload_id = resume.get("new_upload_id") if isinstance(resume, dict) else None
-        if new_upload_id and new_upload_id != upload_id:
-            # A different file was attached mid-intake - replace it,
-            # same cleanup guarantee as Phase 1.
-            if upload_id:
-                await abandon_staged_upload(db, upload_id)
-            upload_id = new_upload_id
-            filename = resume.get("new_filename")
-            size_bytes = resume.get("new_size_bytes")
-            content_type = resume.get("new_content_type")
-            answers = {"applies_to": None, "is_pcs": None, "english_variant": None}
-            continue
-
-        parsed = (resume.get("parsed_answers") or {}) if isinstance(resume, dict) else {}
-        if parsed.get("applies_to") is not None:
-            answers["applies_to"] = parsed["applies_to"]
-        if parsed.get("is_pcs") is not None:
-            answers["is_pcs"] = parsed["is_pcs"]
-        if parsed.get("english_variant") is not None:
-            answers["english_variant"] = parsed["english_variant"]
-
-    # Intake complete - this code runs exactly once (after the LAST
-    # interrupt() call in the loop, never revisited on replay).
-    staged = await get_staged_upload(db, upload_id)
-    if staged is None:
-        logger.error("Staged upload %s not found at job-creation time", upload_id)
-        return {
-            "pending_upload_id": None, "pending_filename": None,
-            "pending_file_size_bytes": None, "pending_content_type": None,
-            "messages": [AIMessage(content="I couldn't find that upload anymore - please attach the document again.")],
-        }
-
-    applies_to = AppliesTo.AUDIT if answers["applies_to"] == "audit" else AppliesTo.GENERAL
-    english_variant = EnglishVariant.GLOBAL if answers["english_variant"] == "global" else EnglishVariant.US
-
-    try:
-        result = await create_job_from_staged_upload(
-            db=db, user_id=user_id, gridfs_file_id=staged.gridfs_file_id,
-            filename=staged.filename, file_size_bytes=staged.size_bytes,
-            max_queued_jobs_per_user=settings.MAX_QUEUED_JOBS_PER_USER,
-            applies_to=applies_to, is_pcs=bool(answers.get("is_pcs")),
-            english_variant=english_variant,
+        return Command(
+            goto=END,
+            update={"messages": [AIMessage(content="I don't see a file attached yet - please upload a document to review.")]},
         )
-    except TooManyQueuedJobsError as e:
+
+    answers = state.get("intake_answers") or {"applies_to": None, "is_pcs": None, "english_variant": None}
+
+    resume = interrupt({"text": _intake_question_text(answers)})
+
+    new_upload_id = resume.get("new_upload_id") if isinstance(resume, dict) else None
+    if new_upload_id and new_upload_id != upload_id:
         await abandon_staged_upload(db, upload_id)
-        return {
-            "pending_upload_id": None, "pending_filename": None,
-            "pending_file_size_bytes": None, "pending_content_type": None,
-            "messages": [AIMessage(content=str(e))],
-        }
+        return Command(
+            goto="handle_submit_document",
+            update={
+                "pending_upload_id": new_upload_id,
+                "pending_filename": resume.get("new_filename"),
+                "pending_file_size_bytes": resume.get("new_size_bytes"),
+                "pending_content_type": resume.get("new_content_type"),
+                "intake_answers": {"applies_to": None, "is_pcs": None, "english_variant": None},
+            },
+        )
 
-    await mark_consumed(db, upload_id, result.job_id)
+    text = resume.get("text", "") if isinstance(resume, dict) else str(resume)
 
-    message = (
-        "Got it - I'll queue this behind your current review; it'll start once that "
-        "one finishes."
-        if result.had_existing_active_job
-        else f"Thanks - I've started reviewing {staged.filename}. "
-        f"I'll let you know when it's done, or ask me to check status anytime."
-    )
+    structured = genai_client.with_structured_output(IntakeInterpretation)
+    try:
+        interpretation: IntakeInterpretation = await structured.ainvoke([
+            SystemMessage(content=(
+                f"The user is in the middle of submitting a document for review. "
+                f"Current question being asked: {_intake_question_text(answers)}\n"
+                f"Already known - applies_to: {answers.get('applies_to')}, "
+                f"is_pcs: {answers.get('is_pcs')}, english_variant: {answers.get('english_variant')}\n\n"
+                "Determine whether the user's message answers the current question "
+                "(even partially), asks to cancel this submission, or is unrelated to "
+                "either."
+            )),
+            HumanMessage(content=text),
+        ])
+    except Exception:
+        logger.error("Intake interpretation failed", exc_info=True)
+        interpretation = IntakeInterpretation(action="unrelated")
 
-    return {
-        "active_job_id": result.job_id,
-        "pending_upload_id": None, "pending_filename": None,
-        "pending_file_size_bytes": None, "pending_content_type": None,
-        "messages": [AIMessage(content=message)],
-    }
+    if interpretation.action == "cancel":
+        await abandon_staged_upload(db, upload_id)
+        return Command(
+            goto=END,
+            update={
+                "pending_upload_id": None, "pending_filename": None,
+                "pending_file_size_bytes": None, "pending_content_type": None,
+                "intake_answers": None,
+                "messages": [AIMessage(content="No problem - I've cancelled that. Let me know if you'd like to submit something else.")],
+            },
+        )
+
+    if interpretation.action == "unrelated":
+        return Command(
+            goto="handle_submit_document",
+            update={
+                "intake_answers": answers,
+                "messages": [AIMessage(content=(
+                    "I didn't quite catch an answer there.\n\n" + _intake_question_text(answers) +
+                    "\n\n(Or let me know if you'd like to cancel this review instead.)"
+                ))],
+            },
+        )
+
+    if interpretation.applies_to is not None:
+        answers["applies_to"] = interpretation.applies_to
+    if interpretation.is_pcs is not None:
+        answers["is_pcs"] = interpretation.is_pcs
+    if interpretation.english_variant is not None:
+        answers["english_variant"] = interpretation.english_variant
+
+    if _intake_complete(answers):
+        return Command(goto="create_review_job", update={"intake_answers": answers})
+
+    return Command(goto="handle_submit_document", update={"intake_answers": answers})

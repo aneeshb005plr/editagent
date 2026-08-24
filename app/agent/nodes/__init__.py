@@ -20,6 +20,7 @@ from app.agent.nodes.scope_change import handle_scope_change_node
 from app.agent.nodes.social import handle_social_node
 from app.agent.nodes.submit_document import handle_submit_document_node
 from app.agent.nodes.unclear import handle_unclear_node
+from app.agent.nodes.create_review_job import create_review_job_node
 
 __all__ = [
     "classify_intent_node",
@@ -33,4 +34,5 @@ __all__ = [
     "handle_scope_change_node",
     "handle_additional_output_node",
     "handle_unclear_node",
+    "create_review_job_node"
 ]

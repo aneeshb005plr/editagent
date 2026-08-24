@@ -1,35 +1,23 @@
 """
 app/services/chat_service.py
 
-PHASE 2 CHANGES:
+REBUILT per external review point 3: this module is now genuinely
+CHANNEL/DOMAIN-NEUTRAL - it no longer knows anything about
+"IntakeAnswers" or EditEdge-specific intake semantics. It detects an
+interrupted thread and resumes with a generic payload (raw user
+text + any newly-staged attachment reference); interpreting what
+that means is entirely the graph/node's job (see app/agent/nodes/
+submit_document.py). This is what lets future interrupt types
+(finding clarification, document selection, approval flows, etc.)
+get added without this file ever needing to change - exactly the
+concern the external review raised: "That will become a problem
+when you later have interrupts for [other things]."
 
-- Accepts a PRE-BUILT graph now, not a checkpointer to build one
-  from on every call. "Compile graph once" per the architecture doc
-  - build_graph(checkpointer) should run ONCE at startup (main.py's
-  lifespan, stored on app.state.chat_graph), not on every turn.
-
-- Detects an INTERRUPTED thread via graph.aget_state(config).
-  interrupts (confirmed via direct, isolated test against our real
-  installed langgraph: snapshot.next only reliably reflects the
-  FIRST interrupt in a sequence - it goes back to empty after the
-  second and every subsequent pause within the same node's loop,
-  even though the thread is genuinely still waiting. snapshot.
-  interrupts stays non-empty for every pause in the sequence, empty
-  exactly when actually complete - the reliable signal) and resumes
-  via Command(resume=...) instead of a normal state update.
-
-- Does the ONE-TIME IntakeAnswers parsing HERE, not inside the
-  intake node's loop - confirmed necessary by direct measurement
-  (see app/agent/nodes/submit_document.py's module docstring for the
-  full reasoning: code between interrupt() calls re-executes on
-  every replay, so an LLM call there would silently multiply). This
-  function runs exactly once per real HTTP request, so parsing here
-  is genuinely "once per reply," which is what the architecture
-  doc's acceptance criterion requires.
-
-- Stages any attachment BEFORE resuming too, not just on a fresh
-  turn - a file attached mid-intake needs to flow into the resume
-  payload's new_upload_id, not the normal turn_input path.
+This was SAFE to do only because of the graph.py redesign
+(one interrupt() per node invocation, looping via a graph-level
+conditional edge) - moving parsing back to the node layer would have
+reintroduced the redundant-execution bug otherwise (confirmed via
+direct measurement earlier in this build).
 """
 
 from __future__ import annotations
@@ -40,7 +28,6 @@ import uuid
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
-from app.agent.models import IntakeAnswers
 from app.repository import message_repository
 from app.schema.chat import ChatTurnRequest, ChatTurnResponse
 from app.services.upload_service import stage_upload
@@ -54,24 +41,10 @@ _DEFAULT_STATE_FIELDS = {
     "pending_filename": None,
     "pending_file_size_bytes": None,
     "pending_content_type": None,
+    "intake_answers": None,
     "turn_count": 0,
     "consecutive_unclear_count": 0,
 }
-
-
-async def _parse_intake_answer(genai_client, text: str) -> dict:
-    """The ONE real place intake-answer LLM parsing happens - see
-    module docstring. Returns a plain dict, never raises (falls back
-    to an all-None dict on failure, same graceful-degradation
-    pattern used throughout this codebase)."""
-
-    structured = genai_client.with_structured_output(IntakeAnswers)
-    try:
-        parsed: IntakeAnswers = await structured.ainvoke([HumanMessage(content=text)])
-    except Exception:
-        logger.error("Intake answer parsing failed", exc_info=True)
-        return {}
-    return parsed.model_dump()
 
 
 async def send_message(
@@ -90,15 +63,11 @@ async def send_message(
 
     snapshot = await graph.aget_state(config)
     is_new_thread = not snapshot.values
-    # FIXED REAL BUG, confirmed by direct, isolated test against our
-    # real installed langgraph: snapshot.next goes back to empty
-    # after the SECOND (and every subsequent) interrupt within the
-    # same node's loop, even though the thread is genuinely still
-    # paused - only the FIRST interrupt in a sequence is reflected
-    # in .next. snapshot.interrupts is the reliable signal - stays
-    # non-empty for every pause in the sequence, confirmed via direct
-    # test (3-call sequence: non-empty, non-empty, empty exactly when
-    # actually complete).
+    # snapshot.interrupts (not .next) is the reliable signal across a
+    # multi-turn interrupt sequence - confirmed via direct, isolated
+    # test against our real installed langgraph (.next only reflects
+    # the FIRST pause in a sequence, going back to empty afterward
+    # even while genuinely still paused).
     is_interrupted = bool(snapshot.interrupts)
     previous_active_job_id = snapshot.values.get("active_job_id") if snapshot.values else None
 
@@ -114,9 +83,10 @@ async def send_message(
 
     try:
         if is_interrupted:
-            parsed_answers = await _parse_intake_answer(genai_client, request.message_text)
+            # GENERIC resume payload - raw text plus any newly-staged
+            # attachment reference. No EditEdge-specific parsing here.
             resume_payload = {
-                "parsed_answers": parsed_answers,
+                "text": request.message_text,
                 "new_upload_id": staged_upload_id,
                 "new_filename": staged_filename,
                 "new_size_bytes": staged_size,

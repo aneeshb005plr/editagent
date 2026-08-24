@@ -1,5 +1,5 @@
 """
-app/repositories/staged_upload_repository.py
+app/repository/staged_upload_repository.py
 
 Persistence for StagedUpload records. Matches the established
 layer-based convention (app/repository/message_repository.py
@@ -52,3 +52,19 @@ async def mark_abandoned(db: AsyncDatabase, upload_id: str) -> None:
         {"_id": ObjectId(upload_id)},
         {"$set": {"status": StagedUploadStatus.ABANDONED.value, "updated_at": _utcnow()}},
     )
+
+
+async def find_expired_staged_uploads(db, limit: int = 100):
+    """FIX for external review point 9. Only STAGED (not consumed/
+    already-abandoned) uploads past their expiry - consumed/abandoned
+    ones are already accounted for and shouldn't be touched again.
+    Returns (upload_id, StagedUpload) tuples - StagedUpload itself
+    doesn't carry its own Mongo _id, same reasoning as jobs/
+    repository.py's get_job_by_source_upload_id()."""
+    from datetime import datetime, timezone
+    cursor = db[_COLLECTION].find({
+        "status": StagedUploadStatus.STAGED.value,
+        "expires_at": {"$lt": datetime.now(timezone.utc)},
+    }).limit(limit)
+    docs = await cursor.to_list(length=limit)
+    return [(str(doc["_id"]), _to_upload(doc)) for doc in docs]

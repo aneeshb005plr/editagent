@@ -19,6 +19,13 @@ PHASE 2 CHANGES:
   anymore - if we're mid-intake, this node simply doesn't run on
   that turn.
 
+- FIX for external review finding: the detailed intent definitions
+  were accidentally lost during an environment-reset reconstruction
+  earlier in this build and replaced with a bare one-liner - a
+  literal Pydantic schema ensures the model returns an ALLOWED
+  label, but doesn't teach it what those labels actually MEAN.
+  Restored the full definitions below.
+
 - consecutive_unclear_count replaces turn_count as the real circuit
   breaker (Phase 2, per the architecture doc). Resets to 0 whenever
   intent resolves to anything other than unclear - including the
@@ -39,7 +46,19 @@ from app.agent.state import ChatState
 
 logger = logging.getLogger("app.agent.nodes.classify_intent")
 
-_INTENT_SYSTEM_PROMPT = "Classify the user's latest message into exactly one intent."
+_INTENT_SYSTEM_PROMPT = """You classify the user's latest message into exactly one intent for a document-review assistant (EditEdge) that reviews PwC pursuit/proposal documents for style, grammar, and risk-language compliance.
+
+Intents:
+- social: greetings, thanks, farewells, small talk
+- off_topic: requests unrelated to document review or the style guide
+- knowledge_question: asking ABOUT a style/grammar/risk-language rule, without submitting a document (e.g. "can I say customer in my proposal?")
+- submit_document: a file is attached, or the user wants to submit one for review
+- check_status: asking about the progress/result of a review already submitted
+- finding_followup: asking about a SPECIFIC finding from a completed review
+- scope_change: wants to change how an already-submitted review is being handled
+- new_document: attaching or wanting to submit ANOTHER document mid-conversation
+- additional_output: wants findings presented differently (export, table, etc.)
+- unclear: genuinely ambiguous - don't guess"""
 
 
 def _build_genai_context(state: ChatState) -> str:
