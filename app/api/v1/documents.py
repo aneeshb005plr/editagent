@@ -106,7 +106,13 @@ async def submit_review(
             english_variant=english_variant,
         )
     except TooManyQueuedJobsError as e:
-        raise HTTPException(status_code=429, detail=str(e))
+        # FIX for external review point 3 (second production-
+        # hardening pass): use the clean user_message, not str(e) -
+        # str(e) includes the raw internal user_id value, which has
+        # no business appearing in an HTTP error response the caller
+        # sees. Same fix applied to the chat path's equivalent
+        # handler in app/agent/nodes/create_review_job.py.
+        raise HTTPException(status_code=429, detail=e.user_message)
 
     message = (
         "Queued behind your current review - it'll run once that one finishes."

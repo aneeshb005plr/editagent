@@ -1,27 +1,34 @@
 """
 app/agent/nodes/create_review_job.py
 
-FIX for external review point 5: previously only checked whether the
-staged upload record existed at all - an ABANDONED record (GridFS
-bytes already deleted) or an EXPIRED-but-still-STAGED one could
-theoretically become a ReviewJob pointing at a file that's gone or
-about to be cleaned up. Now distinguishes every real state:
-CONSUMED (resolve to the existing job), ABANDONED (reject clearly),
-expired-STAGED (reject, opportunistically clean up), missing (ask to
-re-upload), and only a genuinely valid STAGED record proceeds.
+FIX for external review points 1-2 (second production-hardening
+pass): "CONSUMED + consumed_job_id=None" is now treated as a genuine
+RECONCILIATION state, not just a "please wait" state, in every place
+it's encountered - both right after an unexpected (non-
+TooManyQueuedJobsError) exception from create_job_from_staged_upload(),
+and on any later re-entry that finds a record already stuck this way
+(e.g. because a prior set_consumed_job_id() call itself failed after
+the job was actually created).
 
-TWO-PHASE RESERVE closes a real race window found while implementing
-this: if the record were only marked consumed AFTER a job is
-created, a concurrent cleanup sweep could win the CAS on the
-STAGED->ABANDONED transition and delete the GridFS file in the brief
-window between "job created" and "upload marked consumed" - the job
-would then point at a file that no longer exists. Fixed by
-RESERVING first (CAS STAGED->CONSUMED with job_id=None, BEFORE the
-job exists) - the instant that reservation is won, the record is no
-longer STAGED, so cleanup's own CAS can never match it again. The
-real job_id is filled in afterward via set_consumed_job_id(), which
-is safe as a plain (non-CAS) update since by then no one else can be
-racing against this specific record.
+_reconcile_stuck_reservation() is the shared logic: look up the real
+job via source_upload_id FIRST. If found, repair the link and return
+it - this is exactly why the unique source_upload_id constraint from
+the prior hardening pass matters, since it's what makes "the job DID
+get created despite an error being reported to us" a real, expected
+possibility rather than something we can hand-wave away.
+
+Two different "not found" behaviors depending on WHO is asking,
+deliberately:
+  - Right after OUR OWN failed creation attempt: we know with
+    certainty our attempt is over (succeeded-but-reported-error, or
+    genuinely failed) - not found means genuinely failed, so we
+    safely release the reservation and clean up.
+  - On a later, independent re-entry (not from our own attempt):
+    another invocation may be mid-creation RIGHT NOW - not found here
+    is genuinely ambiguous, so we do NOT release (that could race
+    against a real, in-progress creation and delete a file it's about
+    to need) - we ask the user to wait, same as before, but only
+    AFTER first checking whether it's already resolved.
 """
 
 from __future__ import annotations
@@ -35,6 +42,7 @@ from langgraph.runtime import Runtime
 from app.agent.context import ChatContext
 from app.agent.state import ChatState
 from app.config import settings
+from app.jobs import repository as jobs_repository
 from app.jobs.service import TooManyQueuedJobsError, create_job_from_staged_upload
 from app.jobs.storage import delete_file
 from app.repository.staged_upload_repository import (
@@ -44,7 +52,7 @@ from app.repository.staged_upload_repository import (
     set_consumed_job_id,
 )
 from app.rules.schema import AppliesTo, EnglishVariant
-from app.schema.staged_upload import StagedUploadStatus
+from app.schema.staged_upload import StagedUpload, StagedUploadStatus
 from app.services.upload_service import abandon_staged_upload
 
 logger = logging.getLogger("app.agent.nodes.create_review_job")
@@ -56,6 +64,33 @@ _CLEAR_INTAKE_FIELDS = {
 }
 
 _UPLOAD_GONE_MESSAGE = "That upload is no longer available - please attach the document again."
+_STILL_PROCESSING_MESSAGE = "That submission is already being processed - please wait a moment."
+
+
+async def _reconcile_stuck_reservation(db, upload_id: str, staged: StagedUpload, may_release: bool) -> dict | None:
+    """Shared reconciliation for a CONSUMED-with-no-job_id record.
+    Returns a state-update dict if resolved, or None if the caller
+    should treat it as still-ambiguous (only meaningful when
+    may_release=False)."""
+
+    existing = await jobs_repository.get_job_by_source_upload_id(db, upload_id)
+    if existing is not None:
+        existing_job_id, _ = existing
+        await set_consumed_job_id(db, upload_id, existing_job_id)
+        logger.info("Reconciled stuck reservation for upload %s -> job %s", upload_id, existing_job_id)
+        return {"active_job_id": existing_job_id, **_CLEAR_INTAKE_FIELDS,
+                "messages": [AIMessage(content="That review is already underway.")]}
+
+    if may_release:
+        # We just attempted creation ourselves and got an unexpected
+        # error - our attempt is definitively over, and no job exists
+        # for it, so it's safe to conclude it genuinely failed.
+        logger.warning("Upload %s reserved but no job found after an unexpected creation error - releasing", upload_id)
+        await release_reservation(db, upload_id)
+        await delete_file(db, staged.gridfs_file_id)
+        return {**_CLEAR_INTAKE_FIELDS, "messages": [AIMessage(content="That submission couldn't be completed - please try again.")]}
+
+    return None
 
 
 async def create_review_job_node(state: ChatState, runtime: Runtime[ChatContext]) -> dict:
@@ -71,12 +106,16 @@ async def create_review_job_node(state: ChatState, runtime: Runtime[ChatContext]
 
     if staged.status == StagedUploadStatus.CONSUMED:
         if staged.consumed_job_id:
-            # Already consumed - a retry of this exact turn (e.g. the
-            # response was lost after this node already ran). Resolve
-            # to the existing job rather than erroring.
             return {"active_job_id": staged.consumed_job_id, **_CLEAR_INTAKE_FIELDS,
                     "messages": [AIMessage(content="That review is already underway.")]}
-        return {**_CLEAR_INTAKE_FIELDS, "messages": [AIMessage(content="That submission is already being processed - please wait a moment.")]}
+        # FIX for external review point 2: reconcile FIRST, rather
+        # than immediately assuming "still processing" - a prior
+        # set_consumed_job_id() call may have failed even though the
+        # job itself was created successfully.
+        resolved = await _reconcile_stuck_reservation(db, upload_id, staged, may_release=False)
+        if resolved is not None:
+            return resolved
+        return {**_CLEAR_INTAKE_FIELDS, "messages": [AIMessage(content=_STILL_PROCESSING_MESSAGE)]}
 
     if staged.status == StagedUploadStatus.ABANDONED:
         return {**_CLEAR_INTAKE_FIELDS, "messages": [AIMessage(content=_UPLOAD_GONE_MESSAGE)]}
@@ -85,12 +124,8 @@ async def create_review_job_node(state: ChatState, runtime: Runtime[ChatContext]
         await abandon_staged_upload(db, upload_id)
         return {**_CLEAR_INTAKE_FIELDS, "messages": [AIMessage(content="That upload has expired - please attach the document again.")]}
 
-    # Genuinely STAGED and not expired - RESERVE before creating the
-    # job (see module docstring for why this ordering matters).
     reserved = await mark_consumed(db, upload_id, job_id=None)
     if not reserved:
-        # Lost the race to a concurrent cleanup sweep (or another
-        # invocation) between our read above and this CAS attempt.
         refreshed = await get_staged_upload(db, upload_id)
         if refreshed and refreshed.status == StagedUploadStatus.CONSUMED and refreshed.consumed_job_id:
             return {"active_job_id": refreshed.consumed_job_id, **_CLEAR_INTAKE_FIELDS,
@@ -110,17 +145,29 @@ async def create_review_job_node(state: ChatState, runtime: Runtime[ChatContext]
             source_upload_id=upload_id,
         )
     except TooManyQueuedJobsError as e:
-        # We already reserved (CONSUMED, no job) but couldn't create
-        # the job - release the reservation properly. FIXED REAL BUG
-        # found while writing this: mark_abandoned()'s CAS requires
-        # status==STAGED, which no longer matches here (we're
-        # CONSUMED) - calling it would have silently no-op'd, leaving
-        # this record stuck forever. release_reservation() is the
-        # correctly-scoped transition for this specific state.
         logger.info("Reserved upload %s but job creation was rejected (queue full) - releasing", upload_id)
         await release_reservation(db, upload_id)
         await delete_file(db, staged.gridfs_file_id)
-        return {**_CLEAR_INTAKE_FIELDS, "messages": [AIMessage(content=str(e))]}
+        # FIX for external review point 3 (queue-cap message leaking
+        # user_id): use the clean, generic user-facing message rather
+        # than str(e), which includes the internal user_id value.
+        return {**_CLEAR_INTAKE_FIELDS, "messages": [AIMessage(content=e.user_message)]}
+    except Exception:
+        # FIX for external review point 1 - THE most important
+        # remaining issue per the review: any OTHER exception here
+        # (Mongo transient failure, network problem, etc.) previously
+        # had NO recovery at all - the reservation would be stuck as
+        # CONSUMED-with-no-job forever, invisible to cleanup (which
+        # only examines STAGED records). Now reconciles: checks
+        # whether the job actually got created despite the error
+        # (a real possibility - e.g. the insert committed but the
+        # driver reported a network failure before we saw success)
+        # before concluding it genuinely failed.
+        logger.error("Unexpected error creating job for upload %s", upload_id, exc_info=True)
+        resolved = await _reconcile_stuck_reservation(db, upload_id, staged, may_release=True)
+        if resolved is not None:
+            return resolved
+        return {**_CLEAR_INTAKE_FIELDS, "messages": [AIMessage(content="That submission couldn't be completed - please try again.")]}
 
     await set_consumed_job_id(db, upload_id, result.job_id)
 

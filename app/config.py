@@ -296,6 +296,16 @@ class Settings(BaseSettings):
         le=10000,
     )
 
+
+    STAGED_UPLOAD_CLEANUP_INTERVAL_SECONDS: int = Field(default=300, ge=1)
+    # Per external review point 6 (production-hardening pass, second
+    # round): previously every worker slot ran expired-upload cleanup
+    # on every idle cycle - correct (CAS-safe) but wasteful repeated
+    # database work under a busy queue with multiple slots. Throttled
+    # via app.state.last_staged_upload_cleanup_at in app/jobs/worker.py
+    # - untuned default, same status as every other interval setting
+    # in this project.
+
     # ------------------------------------------------------------------
     # Feature flags
     # ------------------------------------------------------------------

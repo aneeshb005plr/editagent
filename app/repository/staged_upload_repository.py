@@ -49,6 +49,16 @@ def _to_upload(doc: dict) -> StagedUpload:
     doc.pop("_id", None)
     return StagedUpload(**doc)
 
+async def ensure_indexes(db) -> None:
+    """FIX for external review point 7/1 (second production-
+    hardening pass): the cleanup query (status=STAGED, expires_at 
+    now) had no supporting index - as staged_uploads grows, every
+    worker slot's periodic cleanup check would mean a full collection
+    scan. Compound index on (status, expires_at) matches the query
+    shape directly."""
+
+    await db[_COLLECTION].create_index([("status", 1), ("expires_at", 1)])
+
 
 async def create_staged_upload(db: AsyncDatabase, upload: StagedUpload) -> str:
     result = await db[_COLLECTION].insert_one(upload.model_dump())

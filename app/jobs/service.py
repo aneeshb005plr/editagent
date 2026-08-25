@@ -39,9 +39,19 @@ logger = logging.getLogger("app.jobs.service")
 
 
 class TooManyQueuedJobsError(Exception):
+    """FIX for external review point 3 (second production-hardening
+    pass): user_message is a clean, generic string with no internal
+    identifiers - callers building user-facing text (chat replies,
+    HTTP error details) should use THIS, not str(e)/args, which
+    still include the raw user_id for logging/debugging purposes."""
+
     def __init__(self, user_id: str, limit: int):
         self.user_id = user_id
         self.limit = limit
+        self.user_message = (
+            "You already have the maximum number of reviews queued or running. "
+            "Please try again after one finishes."
+        )
         super().__init__(
             f"User {user_id} already has {limit} active review(s) queued/running - "
             f"submit again once one completes."

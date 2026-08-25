@@ -15,7 +15,8 @@ from app.utils.error_handlers import register_error_handlers
 from app.utils.access_log_filter import configure_access_log_filter
 from app.llm import connect_genai, close_genai
 from app.jobs.worker import start_worker, stop_worker
-from app.jobs.repository import ensure_indexes
+from app.jobs.repository import ensure_indexes as ensure_job_indexes
+from app.repository.staged_upload_repository import ensure_indexes as ensure_staged_upload_indexes
 from app.agent.graph import build_graph
 
 from app.api.v1.router import router
@@ -26,9 +27,6 @@ logger = logging.getLogger(__name__)
 configure_access_log_filter()
 
 
-# - Guarded cleanup helpers (module-level, shared by startup-abort and
-#   shutdown paths). Each step is independently guarded so one failure
-#   can't mask the original error or skip the remaining cleanups.
 async def _safe_async(name: str, coro) -> None:
     try:
         await coro
@@ -55,14 +53,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # - MongoDB (async + sync-for-vector-search clients)
         await connect_to_mongo(app)
 
-        # - Index setup. FATAL on failure, deliberately - this is the
-        #   partial unique index on review_jobs.source_upload_id
-        #   (external review, production-hardening pass, point 2).
-        #   Without it, the chat flow's job-creation idempotency
-        #   guarantee is only an application-level best-effort check,
-        #   not an actually-enforced one - starting up without it
-        #   would silently defeat the whole reason it was added.
-        await ensure_indexes(app.state.mongo_db)
+        # - Index setup. FATAL on failure, deliberately - both are
+        #   real correctness guarantees the application depends on,
+        #   not optional performance tuning:
+        #   - review_jobs.source_upload_id (unique, partial): the
+        #     chat flow's job-creation idempotency guarantee.
+        #   - staged_uploads (status, expires_at): supports the
+        #     expired-upload cleanup query efficiently as the
+        #     collection grows.
+        await ensure_job_indexes(app.state.mongo_db)
+        await ensure_staged_upload_indexes(app.state.mongo_db)
 
         # - Checkpointer. Construction is blocking (index creation), so
         #   run it off the event loop.
