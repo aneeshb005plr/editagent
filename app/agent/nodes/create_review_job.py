@@ -149,10 +149,26 @@ async def create_review_job_node(state: ChatState, runtime: Runtime[ChatContext]
 
     reserved = await mark_consumed(db, upload_id, job_id=None)
     if not reserved:
+        # FIX per explicit review request: previously only handled
+        # CONSUMED+job_id-present here - CONSUMED+job_id=None (a
+        # CONCURRENT invocation legitimately holds this reservation
+        # right now and may still be creating the job) incorrectly
+        # fell through to "upload gone". Reuses the existing
+        # _reconcile_stuck_reservation(may_release=False) - it never
+        # releases/deletes here, since we do NOT own this reservation.
         refreshed = await get_staged_upload(db, upload_id)
-        if refreshed and refreshed.status == StagedUploadStatus.CONSUMED and refreshed.consumed_job_id:
-            return {"active_job_id": refreshed.consumed_job_id, **_CLEAR_INTAKE_FIELDS,
-                    "messages": [AIMessage(content="That review is already underway.")]}
+        if refreshed is None:
+            return {**_CLEAR_INTAKE_FIELDS, "messages": [AIMessage(content=_UPLOAD_GONE_MESSAGE)]}
+
+        if refreshed.status == StagedUploadStatus.CONSUMED:
+            if refreshed.consumed_job_id:
+                return {"active_job_id": refreshed.consumed_job_id, **_CLEAR_INTAKE_FIELDS,
+                        "messages": [AIMessage(content="That review is already underway.")]}
+            resolved = await _reconcile_stuck_reservation(db, upload_id, refreshed, may_release=False)
+            if resolved is not None:
+                return resolved
+            return {**_CLEAR_INTAKE_FIELDS, "messages": [AIMessage(content=_STILL_PROCESSING_MESSAGE)]}
+
         return {**_CLEAR_INTAKE_FIELDS, "messages": [AIMessage(content=_UPLOAD_GONE_MESSAGE)]}
 
     applies_to = AppliesTo.AUDIT if answers.get("applies_to") == "audit" else AppliesTo.GENERAL
