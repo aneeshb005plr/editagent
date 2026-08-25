@@ -61,31 +61,41 @@ async def _process_job(app, job_id: str, job: ReviewJob) -> None:
             file_bytes=file_bytes, filename=job.filename, max_size_mb=settings.MAX_FILE_SIZE_MB,
             vision_model=genai_client.bind(temperature=0, max_tokens=1000),
         )
-        del file_bytes  # FIX for external review point 4 - no longer
-        # needed once parsed; freeing it now matters under concurrent
-        # large-file processing.
+        del file_bytes
 
         await repository.heartbeat_job(db, job_id)
         findings = await review_document(
             parsed=parsed, rule_set=RULE_SET, applies_to=job.applies_to,
             judgment_model=genai_client, english_variant=job.english_variant, is_pcs=job.is_pcs,
         )
-        del parsed  # FIX for external review point 4 - same reasoning.
+        del parsed
 
         await repository.heartbeat_job(db, job_id)
         await save_findings(db, job_id, findings)
         await repository.complete_job(db, job_id, finding_count=len(findings))
-        await delete_file(db, job.gridfs_file_id)
         logger.info("Job %s completed: %s -> %d findings", job_id, job.filename, len(findings))
     except Exception as e:
-        # FIX for external review point 3/2 - THE real bug: this used
-        # to be `except Exception:` with `str(Exception)` (the class,
-        # not the instance) below, producing "<class 'Exception'>" for
-        # every failure and destroying all diagnostic value. Now
-        # captures and stores the actual error.
         logger.error("Job %s failed: %s", job_id, job.filename, exc_info=True)
         await repository.fail_job(db, job_id, error_message=str(e))
+        return
 
+    # FIX per explicit review request: source-file cleanup is now a
+    # SEPARATE concern, outside the try/except above that calls
+    # fail_job(). Previously delete_file() lived inside that same
+    # try block - if it failed AFTER complete_job() had already
+    # succeeded, the exception fell into the except handler and
+    # fail_job() overwrote an already-SUCCEEDED job back to FAILED.
+    # A review that genuinely succeeded (findings saved, job marked
+    # SUCCEEDED) must stay SUCCEEDED regardless of whether cleanup
+    # of the now-unneeded source file works - cleanup failing just
+    # means the file needs cleanup later, not that the review failed.
+    try:
+        await delete_file(db, job.gridfs_file_id)
+    except Exception:
+        logger.error(
+            "Job %s succeeded but source-file cleanup failed - file will need manual/future cleanup",
+            job_id, exc_info=True,
+        )
 
 async def _worker_slot_loop(app, slot_id: int) -> None:
     db = app.state.mongo_db

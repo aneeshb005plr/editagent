@@ -82,13 +82,36 @@ async def _reconcile_stuck_reservation(db, upload_id: str, staged: StagedUpload,
                 "messages": [AIMessage(content="That review is already underway.")]}
 
     if may_release:
-        # We just attempted creation ourselves and got an unexpected
-        # error - our attempt is definitively over, and no job exists
-        # for it, so it's safe to conclude it genuinely failed.
-        logger.warning("Upload %s reserved but no job found after an unexpected creation error - releasing", upload_id)
-        await release_reservation(db, upload_id)
-        await delete_file(db, staged.gridfs_file_id)
-        return {**_CLEAR_INTAKE_FIELDS, "messages": [AIMessage(content="That submission couldn't be completed - please try again.")]}
+        # FIX per explicit review request: release_reservation() is a
+        # CAS returning bool - the return value was previously never
+        # checked, so the GridFS file was deleted UNCONDITIONALLY even
+        # when this call LOST the race (e.g. another invocation
+        # created and linked the real job in the window between our
+        # lookup above and this release attempt) - deleting a file a
+        # live job still needs.
+        released = await release_reservation(db, upload_id)
+        if released:
+            # We won the CAS - no one else can be holding or using
+            # this file anymore, safe to delete.
+            logger.warning("Upload %s reserved but no job found after an unexpected creation error - releasing", upload_id)
+            await delete_file(db, staged.gridfs_file_id)
+            return {**_CLEAR_INTAKE_FIELDS, "messages": [AIMessage(content="That submission couldn't be completed - please try again.")]}
+
+        # Lost the CAS - someone else already transitioned this
+        # record between our lookup and this attempt. Re-check for a
+        # job rather than assume anything: it may have just been
+        # created and linked (recover it), or abandoned by something
+        # else entirely (nothing to delete, we don't own the file).
+        refreshed = await jobs_repository.get_job_by_source_upload_id(db, upload_id)
+        if refreshed is not None:
+            refreshed_job_id, _ = refreshed
+            await set_consumed_job_id(db, upload_id, refreshed_job_id)
+            logger.info("Lost release CAS for upload %s, but found and linked the job that appeared in the meantime -> %s", upload_id, refreshed_job_id)
+            return {"active_job_id": refreshed_job_id, **_CLEAR_INTAKE_FIELDS,
+                    "messages": [AIMessage(content="That review is already underway.")]}
+
+        logger.info("Lost release CAS for upload %s and no job found - leaving it for reconciliation elsewhere", upload_id)
+        return {**_CLEAR_INTAKE_FIELDS, "messages": [AIMessage(content=_UPLOAD_GONE_MESSAGE)]}
 
     return None
 
