@@ -1,43 +1,44 @@
 """
 app/agent/nodes/submit_document.py
 
-REBUILT twice in this session - first per external review points 1-4
-(one interrupt() per invocation, state-persisted answers), then a
-SECOND real fix found via direct testing of THAT rebuild: routing
-was decided by a separate conditional-edge function (_route_intake
-in graph.py) inferring "should we loop back?" from whether
-intake_answers looked complete - but this couldn't distinguish
-"cancelled, stop" from "still incomplete, keep asking", since both
-states have intake_answers that isn't "complete". Reproduced directly:
-a cancel correctly cleared intake_answers, but the routing function
-then looped back to this SAME node forever (confirmed hang via a
-call-count safety limit in testing, not just theorized).
+PHASE 3B/3C REWRITE - interrupt() removed entirely. See
+app/agent/state.py's module docstring for the full reasoning
+(empirically confirmed incompatibility between interrupt()'s
+resume-only-the-exact-paused-call semantics and suspension/detour).
 
-FIXED by having this node return Command(goto=...) directly - node-
-controlled routing, confirmed via isolated test against our real
-installed langgraph to require no separate conditional-edge function
-at all. Now there is no ambiguous state to misinterpret: cancel goes
-to END explicitly, completion goes to create_review_job explicitly,
-"still incomplete" goes back to this node explicitly - three
-genuinely distinct routing decisions, not one heuristic inferring
-between them.
+This is now a PLAIN node, like every other handler: runs once per
+invocation when classify_intent_node routes here, reads
+pending_action_signal to know what THIS turn means (a fresh
+attachment, an intake answer, continue, or cancel - classify_intent_
+node has ALREADY determined this, possibly via one combined LLM
+call, possibly deterministically - this node does no classification
+of its own), updates persisted state, and either asks the next
+question (a normal AIMessage, turn ends, no pause) or routes to
+create_review_job via Command(goto=...) once complete.
+
+Because there's no interrupt()/loop anymore, this node's own
+completeness-check-then-Command(goto=) pattern is simpler than
+before: no self-loop back to this same node is needed - a
+genuinely fresh classify_intent_node pass happens naturally on the
+NEXT turn, which will route back here again if there's still more
+to ask.
 """
 
 from __future__ import annotations
 
-import logging
-
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langgraph.graph import END
+from langchain_core.messages import AIMessage
 from langgraph.runtime import Runtime
-from langgraph.types import Command, interrupt
+from langgraph.types import Command
 
 from app.agent.context import ChatContext
-from app.agent.models import IntakeInterpretation
 from app.agent.state import ChatState
 from app.services.upload_service import abandon_staged_upload
 
-logger = logging.getLogger("app.agent.nodes.submit_document")
+_CLEAR_PENDING_FIELDS = {
+    "pending_upload_id": None, "pending_filename": None,
+    "pending_file_size_bytes": None, "pending_content_type": None,
+    "intake_answers": None,
+}
 
 
 def _intake_question_text(answers: dict) -> str:
@@ -61,94 +62,51 @@ def _intake_complete(answers: dict) -> bool:
     return True
 
 
-async def handle_submit_document_node(state: ChatState, runtime: Runtime[ChatContext]) -> Command:
+async def handle_submit_document_node(state: ChatState, runtime: Runtime[ChatContext]):
     db = runtime.context["db"]
-    genai_client = runtime.context["genai_client"]
 
-    upload_id = state.get("pending_upload_id")
-    if not upload_id:
-        return Command(
-            goto=END,
-            update={"messages": [AIMessage(content="I don't see a file attached yet - please upload a document to review.")]},
-        )
+    new_upload_id = state.get("new_upload_id")
+    pending_upload_id = state.get("pending_upload_id")
+
+    # A brand-new attachment (classify_intent_node has already ruled
+    # out any conflict with a different pending upload before routing
+    # here) - start fresh intake.
+    if new_upload_id and (not pending_upload_id or new_upload_id == pending_upload_id):
+        fresh_answers = {"applies_to": None, "is_pcs": None, "english_variant": None}
+        return {
+            "pending_upload_id": new_upload_id,
+            "pending_filename": state.get("new_filename"),
+            "pending_file_size_bytes": state.get("new_file_size_bytes"),
+            "pending_content_type": state.get("new_content_type"),
+            "intake_answers": fresh_answers,
+            "messages": [AIMessage(content=_intake_question_text(fresh_answers))],
+        }
+
+    if not pending_upload_id:
+        return {"messages": [AIMessage(content="I don't see a file attached yet - please upload a document to review.")]}
+
+    signal = state.get("pending_action_signal") or {}
+    action = signal.get("action")
+
+    if action == "cancel_intake":
+        await abandon_staged_upload(db, pending_upload_id)
+        return {
+            **_CLEAR_PENDING_FIELDS,
+            "messages": [AIMessage(content="No problem - I've cancelled that. Let me know if you'd like to submit something else.")],
+        }
 
     answers = dict(state.get("intake_answers") or {"applies_to": None, "is_pcs": None, "english_variant": None})
-    # FIX for external review point 6: copy the dict rather than
-    # mutate the object read from state in place. state.get(...)
-    # returns a reference to whatever's checkpointed - mutating it
-    # directly risks unpredictable checkpoint/replay behavior (the
-    # same class of concern LangGraph's own reducer pattern exists to
-    # avoid) even though this specific code path happened to behave
-    # correctly in testing. A fresh copy is unambiguously safe.
 
-    resume = interrupt({"text": _intake_question_text(answers)})
-
-    new_upload_id = resume.get("new_upload_id") if isinstance(resume, dict) else None
-    if new_upload_id and new_upload_id != upload_id:
-        await abandon_staged_upload(db, upload_id)
-        return Command(
-            goto="handle_submit_document",
-            update={
-                "pending_upload_id": new_upload_id,
-                "pending_filename": resume.get("new_filename"),
-                "pending_file_size_bytes": resume.get("new_size_bytes"),
-                "pending_content_type": resume.get("new_content_type"),
-                "intake_answers": {"applies_to": None, "is_pcs": None, "english_variant": None},
-            },
-        )
-
-    text = resume.get("text", "") if isinstance(resume, dict) else str(resume)
-
-    structured = genai_client.with_structured_output(IntakeInterpretation)
-    try:
-        interpretation: IntakeInterpretation = await structured.ainvoke([
-            SystemMessage(content=(
-                f"The user is in the middle of submitting a document for review. "
-                f"Current question being asked: {_intake_question_text(answers)}\n"
-                f"Already known - applies_to: {answers.get('applies_to')}, "
-                f"is_pcs: {answers.get('is_pcs')}, english_variant: {answers.get('english_variant')}\n\n"
-                "Determine whether the user's message answers the current question "
-                "(even partially), asks to cancel this submission, or is unrelated to "
-                "either."
-            )),
-            HumanMessage(content=text),
-        ])
-    except Exception:
-        logger.error("Intake interpretation failed", exc_info=True)
-        interpretation = IntakeInterpretation(action="unrelated")
-
-    if interpretation.action == "cancel":
-        await abandon_staged_upload(db, upload_id)
-        return Command(
-            goto=END,
-            update={
-                "pending_upload_id": None, "pending_filename": None,
-                "pending_file_size_bytes": None, "pending_content_type": None,
-                "intake_answers": None,
-                "messages": [AIMessage(content="No problem - I've cancelled that. Let me know if you'd like to submit something else.")],
-            },
-        )
-
-    if interpretation.action == "unrelated":
-        return Command(
-            goto="handle_submit_document",
-            update={
-                "intake_answers": answers,
-                "messages": [AIMessage(content=(
-                    "I didn't quite catch an answer there.\n\n" + _intake_question_text(answers) +
-                    "\n\n(Or let me know if you'd like to cancel this review instead.)"
-                ))],
-            },
-        )
-
-    if interpretation.applies_to is not None:
-        answers["applies_to"] = interpretation.applies_to
-    if interpretation.is_pcs is not None:
-        answers["is_pcs"] = interpretation.is_pcs
-    if interpretation.english_variant is not None:
-        answers["english_variant"] = interpretation.english_variant
+    if action == "intake_answer":
+        if signal.get("applies_to") is not None:
+            answers["applies_to"] = signal["applies_to"]
+        if signal.get("is_pcs") is not None:
+            answers["is_pcs"] = signal["is_pcs"]
+        if signal.get("english_variant") is not None:
+            answers["english_variant"] = signal["english_variant"]
+    # action == "continue_intake": no new info, just re-ask what's missing below.
 
     if _intake_complete(answers):
         return Command(goto="create_review_job", update={"intake_answers": answers})
 
-    return Command(goto="handle_submit_document", update={"intake_answers": answers})
+    return {"intake_answers": answers, "messages": [AIMessage(content=_intake_question_text(answers))]}

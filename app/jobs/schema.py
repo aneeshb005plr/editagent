@@ -30,6 +30,12 @@ class ReviewJob(BaseModel):
     # instead of creating a duplicate pointing at the same GridFS file.
     # None for jobs from the direct REST path (no staged upload
     # involved there).
+    origin_conversation_id: str | None = None
+    # Phase 3B: the LangGraph thread_id a chat-created job originated
+    # from. Lets the job resolver scope "jobs from this conversation"
+    # separately from "all jobs this user owns" - one of the resolver's
+    # precedence signals. None for REST-created jobs (no conversation
+    # involved there), matching source_upload_id's existing pattern.
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
     started_at: datetime | None = None

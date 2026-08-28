@@ -1,13 +1,14 @@
 """
 app/agent/models.py
 
-FIX for external review point 4 (mid-intake cancellation regression):
-IntakeInterpretation replaces the old IntakeAnswers-only parsing with
-a genuine three-way classification (answer/cancel/unrelated) - the
-previous design silently swallowed anything that wasn't a parseable
-answer into an empty dict and just asked again forever, trapping the
-user. Now cancellation is a real, detected action, and "unrelated"
-gets an honest acknowledgment rather than silent re-asking.
+Intent classification schemas. PendingIntakeTurnClassification
+(Phase 3B/3C) replaces the earlier IntakeInterpretation model -
+combines intake-answer interpretation with detour detection in one
+schema/call, since a pending intake turn now needs to distinguish
+answering/continuing/cancelling from being about something else
+entirely (a detour), not just answer/cancel/unrelated. See that
+class's own docstring and app/agent/nodes/classify_intent.py for the
+full reasoning.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ Intent = Literal[
     "scope_change",
     "new_document",
     "additional_output",
+    "attachment_conflict",
     "unclear",
 ]
 
@@ -38,19 +40,31 @@ class IntentClassification(BaseModel):
     )
 
 
-class IntakeInterpretation(BaseModel):
-    """Interprets a reply given DURING document-review intake -
-    distinguishes answering the current question from asking to
-    cancel, from saying something the model can't relate to either.
-    Every answer field is Optional/None-default - a partial or
-    unclear answer should leave the corresponding field None, NOT
-    guess."""
+class PendingIntakeTurnClassification(BaseModel):
+    """Phase 3C: classifies a turn arriving WHILE a document intake
+    is pending, when the turn is NOT a structurally-obvious
+    deterministic case (a fresh attachment, or an exact "continue"/
+    "cancel" phrase - those are recognized without any LLM call, see
+    classify_intent_node). One combined call replaces what would
+    otherwise be two separate calls (intake interpretation + general
+    intent classification) - it either says this turn IS about the
+    pending intake (answer/continue/cancel), or says it's a DETOUR
+    and classifies what the user actually wants using the SAME
+    Intent taxonomy used everywhere else, so the pending intake can
+    be left untouched while the detour is handled normally."""
 
-    action: Literal["answer", "cancel", "unrelated"] = Field(
-        description="'answer' if this responds to the current intake question (even partially), "
-        "'cancel' if the user wants to stop/abandon this review submission, "
-        "'unrelated' if it's neither."
+    action: Literal["intake_answer", "continue_intake", "cancel_intake", "detour"] = Field(
+        description="'intake_answer' if this responds to the pending intake question, even "
+        "partially; 'continue_intake' if the user wants to resume/continue without giving new "
+        "information right now; 'cancel_intake' if they want to abandon the pending submission; "
+        "'detour' if this is about something else entirely - the pending intake must be left "
+        "completely untouched in that case."
     )
     applies_to: Literal["general", "audit"] | None = None
     is_pcs: bool | None = None
     english_variant: Literal["us", "global"] | None = None
+    detour_intent: Intent | None = Field(
+        default=None,
+        description="Only set when action=='detour' - classify what the user actually wants "
+        "using the same intent taxonomy used for normal classification.",
+    )

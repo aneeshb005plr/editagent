@@ -113,6 +113,7 @@ async def create_job_from_staged_upload(
     is_pcs: bool = False,
     english_variant: EnglishVariant = EnglishVariant.US,
     source_upload_id: str | None = None,
+    origin_conversation_id: str | None = None,
 ) -> SubmissionResult:
     if source_upload_id:
         existing = await repository.get_job_by_source_upload_id(db, source_upload_id)
@@ -126,6 +127,7 @@ async def create_job_from_staged_upload(
         user_id=user_id, filename=filename, file_size_bytes=file_size_bytes,
         gridfs_file_id=gridfs_file_id, applies_to=applies_to, is_pcs=is_pcs,
         english_variant=english_variant, source_upload_id=source_upload_id,
+        origin_conversation_id=origin_conversation_id,
     )
 
     try:

@@ -1,47 +1,43 @@
 """
 app/agent/nodes/classify_intent.py
 
-PHASE 2 CHANGES:
+PHASE 3B/3C REWRITE - see app/agent/state.py's module docstring for
+the full architectural reasoning (interrupt()-based intake removed,
+replaced by this node running fresh, every turn, deciding routing).
 
-- DETERMINISTIC PRE-ROUTER: a new attachment now short-circuits to
-  submit_document/new_document BEFORE any LLM call at all - not
-  "call the classifier, then override the result" like Phase 1 did.
-  Confirmed real requirement from the architecture doc's acceptance
-  criteria ("File attachment uses zero intent-classifier calls").
+Deterministic (zero-LLM-call) routing, in order:
+1. A NEW attachment this turn (new_upload_id) conflicting with an
+   ALREADY-pending, different upload -> attachment_conflict.
+2. A NEW attachment this turn, no conflict -> submit_document/
+   new_document, exactly as Phase 2.
+3. An exact "continue"/"cancel" phrase while intake is pending ->
+   deterministic, no LLM call - these are structurally obvious.
+4. An exact "replace"/"keep" phrase while an attachment conflict is
+   pending resolution -> deterministic, no LLM call.
 
-- The old "pending_intake mid-flow" branch is REMOVED entirely - now
-  handled structurally by interrupt()/resume (see submit_document.py):
-  once inside that node's intake loop, resuming jumps straight back
-  into it without re-running this node at all (confirmed via direct
-  test against our real installed langgraph - classify_node ran
-  exactly once across a full multi-turn interrupt sequence, not once
-  per turn). So there's no "are we mid-intake" check needed here
-  anymore - if we're mid-intake, this node simply doesn't run on
-  that turn.
+Only when NONE of the above apply, and an intake or conflict IS
+pending, is exactly ONE LLM call made - a COMBINED classification
+(PendingIntakeTurnClassification) that either says "this is about
+the pending intake" (answer/continue/cancel) or "this is a detour"
+(classifying what the user actually wants using the same Intent
+taxonomy used for normal turns). This is the key mechanism that
+lets a pending intake be safely left untouched while a detour is
+handled normally - see app/agent/state.py and app/agent/nodes/
+submit_document.py for how the resulting signal is consumed.
 
-- FIX for external review finding: the detailed intent definitions
-  were accidentally lost during an environment-reset reconstruction
-  earlier in this build and replaced with a bare one-liner - a
-  literal Pydantic schema ensures the model returns an ALLOWED
-  label, but doesn't teach it what those labels actually MEAN.
-  Restored the full definitions below.
-
-- consecutive_unclear_count replaces turn_count as the real circuit
-  breaker (Phase 2, per the architecture doc). Resets to 0 whenever
-  intent resolves to anything other than unclear - including the
-  deterministic pre-router path, which never even reaches the
-  "unclear" possibility.
+With NO attachment and NO pending intake/conflict, this is
+UNCHANGED from Phase 2 - normal intent classification.
 """
 
 from __future__ import annotations
 
 import logging
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.runtime import Runtime
 
 from app.agent.context import ChatContext
-from app.agent.models import Intent, IntentClassification
+from app.agent.models import Intent, IntentClassification, PendingIntakeTurnClassification
 from app.agent.state import ChatState
 
 logger = logging.getLogger("app.agent.nodes.classify_intent")
@@ -60,6 +56,11 @@ Intents:
 - additional_output: wants findings presented differently (export, table, etc.)
 - unclear: genuinely ambiguous - don't guess"""
 
+_CONTINUE_PHRASES = {"continue", "continue intake", "continue_intake", "continue my document", "resume"}
+_CANCEL_PHRASES = {"cancel", "cancel intake", "cancel_intake", "never mind", "forget it", "abandon"}
+_REPLACE_PHRASES = {"replace"}
+_KEEP_PHRASES = {"keep"}
+
 
 def _build_genai_context(state: ChatState) -> str:
     recent = state["messages"][-6:]
@@ -70,15 +71,94 @@ def _build_genai_context(state: ChatState) -> str:
     return "\n".join(lines)
 
 
+def _latest_text(state: ChatState) -> str:
+    return state["messages"][-1].content.strip() if state["messages"] else ""
+
+
 async def classify_intent_node(state: ChatState, runtime: Runtime[ChatContext]) -> dict:
     turn_count = state.get("turn_count", 0) + 1
-
-    # DETERMINISTIC PRE-ROUTER - zero LLM calls for this case.
-    if state.get("pending_upload_id"):
-        intent: Intent = "new_document" if state.get("active_job_id") else "submit_document"
-        return {"turn_count": turn_count, "intent": intent, "consecutive_unclear_count": 0}
-
     genai_client = runtime.context["genai_client"]
+
+    new_upload_id = state.get("new_upload_id")
+    pending_upload_id = state.get("pending_upload_id")
+    conflicting_upload_id = state.get("conflicting_upload_id")
+
+    # --- Deterministic: new attachment this turn ---
+    if new_upload_id:
+        if pending_upload_id and new_upload_id != pending_upload_id:
+            return {
+                "turn_count": turn_count, "intent": "attachment_conflict",
+                "consecutive_unclear_count": 0, "pending_action_signal": None,
+                "conflicting_upload_id": new_upload_id,
+                "conflicting_filename": state.get("new_filename"),
+                "conflicting_file_size_bytes": state.get("new_file_size_bytes"),
+                "conflicting_content_type": state.get("new_content_type"),
+            }
+        intent: Intent = "new_document" if state.get("focused_job_id") else "submit_document"
+        return {
+            "turn_count": turn_count, "intent": intent,
+            "consecutive_unclear_count": 0, "pending_action_signal": None,
+        }
+
+    # --- Deterministic: an attachment-conflict choice is pending ---
+    if conflicting_upload_id:
+        text = _latest_text(state).lower()
+        if text in _REPLACE_PHRASES:
+            return {"turn_count": turn_count, "intent": "attachment_conflict",
+                    "pending_action_signal": {"action": "replace"}, "consecutive_unclear_count": 0}
+        if text in _KEEP_PHRASES:
+            return {"turn_count": turn_count, "intent": "attachment_conflict",
+                    "pending_action_signal": {"action": "keep"}, "consecutive_unclear_count": 0}
+        # Anything else while a conflict choice is pending re-presents
+        # the same choice - deliberately narrow scope, no detours
+        # allowed mid-choice (a small, blocking decision, not a full
+        # suspendable workflow like intake itself).
+        return {"turn_count": turn_count, "intent": "attachment_conflict",
+                "pending_action_signal": {"action": "unclear"}, "consecutive_unclear_count": 0}
+
+    # --- No new attachment, but intake IS pending/suspended ---
+    if pending_upload_id:
+        text = _latest_text(state).lower()
+        if text in _CONTINUE_PHRASES:
+            return {"turn_count": turn_count, "intent": "submit_document",
+                    "pending_action_signal": {"action": "continue_intake"}, "consecutive_unclear_count": 0}
+        if text in _CANCEL_PHRASES:
+            return {"turn_count": turn_count, "intent": "submit_document",
+                    "pending_action_signal": {"action": "cancel_intake"}, "consecutive_unclear_count": 0}
+
+        structured = genai_client.with_structured_output(PendingIntakeTurnClassification)
+        try:
+            result: PendingIntakeTurnClassification = await structured.ainvoke([
+                SystemMessage(content=(
+                    "The user has an unfinished document submission pending (intake questions "
+                    "not yet answered). Determine whether their latest message answers the "
+                    "pending question (even partially), wants to continue/cancel it, or is "
+                    "about something else entirely (a detour) - in which case classify what "
+                    "they actually want using the normal intent taxonomy, and the pending "
+                    "submission will be left untouched."
+                )),
+                HumanMessage(content=_build_genai_context(state)),
+            ])
+        except Exception:
+            logger.error("Pending-intake turn classification failed", exc_info=True)
+            result = PendingIntakeTurnClassification(action="detour", detour_intent="unclear")
+
+        if result.action in ("intake_answer", "continue_intake", "cancel_intake"):
+            return {
+                "turn_count": turn_count, "intent": "submit_document",
+                "pending_action_signal": result.model_dump(), "consecutive_unclear_count": 0,
+            }
+
+        # detour - pending intake state is NOT touched at all here.
+        detour_intent = result.detour_intent or "unclear"
+        consecutive_unclear = state.get("consecutive_unclear_count", 0)
+        new_consecutive_unclear = consecutive_unclear + 1 if detour_intent == "unclear" else 0
+        return {
+            "turn_count": turn_count, "intent": detour_intent,
+            "pending_action_signal": None, "consecutive_unclear_count": new_consecutive_unclear,
+        }
+
+    # --- No attachment, no pending intake/conflict - normal classification (unchanged) ---
     structured = genai_client.with_structured_output(IntentClassification)
     try:
         result: IntentClassification = await structured.ainvoke([
@@ -93,11 +173,14 @@ async def classify_intent_node(state: ChatState, runtime: Runtime[ChatContext]) 
     consecutive_unclear = state.get("consecutive_unclear_count", 0)
     new_consecutive_unclear = consecutive_unclear + 1 if intent == "unclear" else 0
 
-    return {"turn_count": turn_count, "intent": intent, "consecutive_unclear_count": new_consecutive_unclear}
+    return {
+        "turn_count": turn_count, "intent": intent,
+        "pending_action_signal": None, "consecutive_unclear_count": new_consecutive_unclear,
+    }
 
 
 def route_by_intent(state: ChatState) -> str:
     intent = state.get("intent") or "unclear"
     if intent == "new_document":
-        return "handle_submit_document"  # reused, see submit_document.py's module docstring
+        return "handle_submit_document"
     return f"handle_{intent}"

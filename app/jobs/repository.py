@@ -110,3 +110,27 @@ async def ensure_indexes(db) -> None:
         unique=True,
         partialFilterExpression={"source_upload_id": {"$type": "string"}},
     )
+
+
+async def list_jobs_by_filename(db, user_id: str, filename: str, limit: int = 10):
+    """Phase 3B job resolver support - bounded, ownership-scoped by
+    construction (user_id is part of the query, not checked after
+    the fact). Used to detect "same filename, multiple jobs"
+    ambiguity (Scenario 7). Returns (job_id, ReviewJob) pairs -
+    ReviewJob doesn't carry its own Mongo _id, same convention as
+    get_job_by_source_upload_id() above."""
+    cursor = db[_COLLECTION].find({"user_id": user_id, "filename": filename}).sort("created_at", -1).limit(limit)
+    docs = await cursor.to_list(length=limit)
+    return [(str(doc["_id"]), _to_job(doc)) for doc in docs]
+
+
+async def list_jobs_by_conversation(db, user_id: str, origin_conversation_id: str, limit: int = 10):
+    """Phase 3B job resolver support - bounded. Scopes to jobs
+    submitted from a specific conversation, for the "recent owned
+    ReviewJobs / origin conversation context" resolution step.
+    Returns (job_id, ReviewJob) pairs, same reasoning as above."""
+    cursor = db[_COLLECTION].find(
+        {"user_id": user_id, "origin_conversation_id": origin_conversation_id}
+    ).sort("created_at", -1).limit(limit)
+    docs = await cursor.to_list(length=limit)
+    return [(str(doc["_id"]), _to_job(doc)) for doc in docs]
