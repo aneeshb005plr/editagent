@@ -17,6 +17,7 @@ from app.llm import connect_genai, close_genai
 from app.jobs.worker import start_worker, stop_worker
 from app.jobs.repository import ensure_indexes as ensure_job_indexes
 from app.repository.staged_upload_repository import ensure_indexes as ensure_staged_upload_indexes
+from app.jobs.findings_repository import ensure_indexes as ensure_findings_indexes
 from app.agent.graph import build_graph
 
 from app.api.v1.router import router
@@ -53,16 +54,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         # - MongoDB (async + sync-for-vector-search clients)
         await connect_to_mongo(app)
 
-        # - Index setup. FATAL on failure, deliberately - both are
-        #   real correctness guarantees the application depends on,
-        #   not optional performance tuning:
+        # - Index setup, in dependency order. All FATAL on failure,
+        #   deliberately - each is a real correctness guarantee this
+        #   application depends on, not optional performance tuning:
         #   - review_jobs.source_upload_id (unique, partial): the
         #     chat flow's job-creation idempotency guarantee.
         #   - staged_uploads (status, expires_at): supports the
-        #     expired-upload cleanup query efficiently as the
-        #     collection grows.
+        #     expired-upload cleanup query efficiently.
+        #   - findings: backfills any legacy findings missing Phase
+        #     3A identity fields BEFORE creating the unique indexes
+        #     on (job_id, display_id) and finding_uid - must run
+        #     before checkpointer/graph/worker startup.
         await ensure_job_indexes(app.state.mongo_db)
         await ensure_staged_upload_indexes(app.state.mongo_db)
+        await ensure_findings_indexes(app.state.mongo_db)
 
         # - Checkpointer. Construction is blocking (index creation), so
         #   run it off the event loop.
