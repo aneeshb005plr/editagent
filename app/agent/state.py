@@ -75,6 +75,14 @@ class ChatState(TypedDict):
     focused_job_id: str | None
     focused_finding_id: str | None
     last_submitted_job_id: str | None
+    last_completed_job_id: str | None
+    # Phase 3B correction pass, item C: added for structural
+    # completeness of the state model - NOT populated by anything in
+    # this pass (the worker never invokes LangGraph, so nothing here
+    # observes completion in real time; populating this correctly is
+    # explicitly the later completion-event/notification phase's
+    # job). Initializes to None on a new conversation, same as its
+    # siblings.
 
     new_upload_id: str | None
     new_filename: str | None
@@ -93,6 +101,21 @@ class ChatState(TypedDict):
     conflicting_content_type: str | None
 
     pending_action_signal: dict | None
+
+    requires_user_input: bool
+    # Phase 3B/3C correction pass, item D: the TRANSIENT, per-turn
+    # signal ChatTurnResponse.status derives "needs_input" from - NOT
+    # pending_upload_id/conflicting_upload_id (a suspended intake can
+    # legitimately persist across many turns that have nothing to do
+    # with it; deriving needs_input from its mere presence was wrong
+    # - see app/services/chat_service.py's docstring for the exact
+    # bug this replaces). app/services/chat_service.py explicitly
+    # resets this to False on every single turn before the graph
+    # runs; only the node that actually handles the turn can set it
+    # True, and only when it's genuinely asking something (an intake
+    # question, a replace/keep choice) - confirmed via direct test
+    # that an unrelated later turn correctly doesn't inherit a stale
+    # True from an earlier one.
 
     turn_count: int
     consecutive_unclear_count: int

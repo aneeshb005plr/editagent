@@ -7,7 +7,7 @@ finding_followup, and later phases) should go through this, not
 reimplement its own guessing.
 
 Typed result contract (ResolutionStatus, JobResolutionResult) lives
-in app/schema/job_resolution.py - this file holds only the service
+in app/schemas/job_resolution.py - this file holds only the service
 logic, matching the established schema/logic separation used
 throughout this project.
 
@@ -44,9 +44,9 @@ from __future__ import annotations
 from bson.errors import InvalidId
 from pymongo.asynchronous.database import AsyncDatabase
 
-from app.jobs import repository as jobs_repository
-from app.jobs.schema import ReviewJob
-from app.schema.job_resolution import JobResolutionResult, ResolutionStatus
+from app.repositories import job_repository as jobs_repository
+from app.schemas.job import ReviewJob
+from app.schemas.job_resolution import JobResolutionResult, ResolutionStatus
 
 _RECENT_CONVERSATION_JOBS_LIMIT = 10
 _FILENAME_MATCH_LIMIT = 10
@@ -77,7 +77,12 @@ async def resolve_job_reference(
             return JobResolutionResult(status=ResolutionStatus.RESOLVED, job_id=explicit_job_id, job=job)
         return JobResolutionResult(status=ResolutionStatus.NOT_FOUND)
 
-    # 2. Explicit filename reference - resolve only if unambiguous.
+    # 2. Explicit filename reference - MUST terminate the resolution
+    # path here (FIX, final correction pass, item E: previously fell
+    # through to focused_job_id/conversation context on zero matches,
+    # meaning an explicit reference to a document that doesn't exist
+    # could silently resolve to a COMPLETELY different job - a real
+    # bug, confirmed by re-reading this exact code path).
     if filename_reference:
         matches = await jobs_repository.list_jobs_by_filename(
             db, user_id, filename_reference, limit=_FILENAME_MATCH_LIMIT
@@ -91,7 +96,12 @@ async def resolve_job_reference(
             # each candidate's ReviewJob.created_at is available to the
             # caller for presenting the clarification.
             return JobResolutionResult(status=ResolutionStatus.AMBIGUOUS, candidates=matches)
-        # 0 matches by filename - fall through, don't guess something else instead.
+        # Zero matches - an EXPLICIT reference to something that
+        # doesn't exist must terminate as NOT_FOUND, never fall
+        # through to focused_job_id or conversation context (that
+        # would silently substitute a different job the user never
+        # asked about).
+        return JobResolutionResult(status=ResolutionStatus.NOT_FOUND)
 
     # 3. Current focus, if nothing more specific was given.
     if focused_job_id:

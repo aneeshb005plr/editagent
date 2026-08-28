@@ -1,11 +1,20 @@
 """
 app/agent/nodes/check_status.py
 
-PHASE 3B: now uses the real job resolver instead of "active_job_id
-or fall back to the single most recent job" - supports multiple
-concurrent jobs correctly, asks for clarification when ambiguous
-rather than guessing (Scenario 7), and never leaks ownership
-information for a malformed/non-owned reference (Scenario 8).
+Uses the real job resolver instead of a bare focused_job_id-only
+lookup - supports multiple concurrent jobs correctly, asks for
+clarification when ambiguous rather than guessing (Scenario 7), and
+never leaks ownership information for a malformed/non-owned
+reference (Scenario 8).
+
+FIX (final Phase 3B/3C correction pass, items D/J): explicitly sets
+requires_user_input=False on every path (a status check is a normal
+conversational exchange, not a blocking intake/conflict workflow,
+even when it ends by asking which review the user meant - see
+app/agent/state.py's docstring for what this signal is actually
+for), and clears focused_finding_id whenever focus resolves to a
+job (a finding from whatever was PREVIOUSLY focused is job-scoped -
+carrying it into a newly-focused job would be wrong, see item J).
 """
 
 from __future__ import annotations
@@ -18,7 +27,7 @@ from langgraph.runtime import Runtime
 from app.agent.context import ChatContext
 from app.agent.state import ChatState
 from app.documents.dispatcher import supported_extensions
-from app.schema.job_resolution import ResolutionStatus
+from app.schemas.job_resolution import ResolutionStatus
 from app.services.job_resolver import resolve_job_reference
 
 _FILENAME_PATTERN = re.compile(
@@ -58,13 +67,15 @@ async def handle_check_status_node(state: ChatState, runtime: Runtime[ChatContex
 
     if result.status == ResolutionStatus.AMBIGUOUS:
         lines = "\n".join(_format_candidate(job) for _, job in result.candidates)
-        return {"messages": [AIMessage(content=f"I found multiple matching reviews. Which one do you mean?\n\n{lines}")]}
+        return {"requires_user_input": False,
+                "messages": [AIMessage(content=f"I found multiple matching reviews. Which one do you mean?\n\n{lines}")]}
 
     if result.status == ResolutionStatus.NOT_FOUND:
-        return {"messages": [AIMessage(content="I couldn't find that review.")]}
+        return {"requires_user_input": False, "messages": [AIMessage(content="I couldn't find that review.")]}
 
     if result.status == ResolutionStatus.NO_CONTEXT:
-        return {"messages": [AIMessage(content="I don't see any reviews to check on yet - which document did you mean?")]}
+        return {"requires_user_input": False,
+                "messages": [AIMessage(content="I don't see any reviews to check on yet - which document did you mean?")]}
 
     job = result.job
     if job.status.value == "succeeded":
@@ -76,4 +87,8 @@ async def handle_check_status_node(state: ChatState, runtime: Runtime[ChatContex
     else:
         text = f"{job.filename} is queued and will start shortly."
 
-    return {"focused_job_id": result.job_id, "messages": [AIMessage(content=text)]}
+    return {
+        "focused_job_id": result.job_id, "focused_finding_id": None,
+        "requires_user_input": False,
+        "messages": [AIMessage(content=text)],
+    }

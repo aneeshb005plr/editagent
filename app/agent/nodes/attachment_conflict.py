@@ -1,22 +1,24 @@
 """
 app/agent/nodes/attachment_conflict.py
 
-Phase 3C: handles "a new attachment arrived while a DIFFERENT
-upload is already mid-intake" - the MVP supports only one unfinished
-staged intake per conversation, so this presents an explicit
-replace/keep choice rather than silently picking one or creating two
-unresolved intakes.
+FIX (final Phase 3B/3C correction pass, item A/D): Command-only
+routing (matches submit_document.py's fix - one routing mechanism,
+not a static edge mixed with occasional Command returns).
+requires_user_input is True only while actually PRESENTING the
+Keep/Replace choice; False once it's actually resolved (replace or
+keep).
 
 Reuses app/services/upload_service.py's existing CAS-safe
-abandon_staged_upload() for both directions of cleanup (whichever
-upload doesn't survive the choice) - no new CAS logic duplicated
-here.
+abandon_staged_upload() for both directions of cleanup - no new CAS
+logic duplicated here.
 """
 
 from __future__ import annotations
 
 from langchain_core.messages import AIMessage
+from langgraph.graph import END
 from langgraph.runtime import Runtime
+from langgraph.types import Command
 
 from app.agent.context import ChatContext
 from app.agent.state import ChatState
@@ -41,7 +43,7 @@ def _intake_question_text(answers: dict) -> str:
     )
 
 
-async def handle_attachment_conflict_node(state: ChatState, runtime: Runtime[ChatContext]) -> dict:
+async def handle_attachment_conflict_node(state: ChatState, runtime: Runtime[ChatContext]) -> Command:
     db = runtime.context["db"]
 
     pending_filename = state.get("pending_filename")
@@ -50,40 +52,38 @@ async def handle_attachment_conflict_node(state: ChatState, runtime: Runtime[Cha
     action = signal.get("action")
 
     if action == "replace":
-        # B is abandoned via the SAME CAS-safe path used everywhere
-        # else - deletes the GridFS bytes only if this call genuinely
-        # wins the STAGED->ABANDONED transition.
         await abandon_staged_upload(db, state.get("pending_upload_id"))
-
         fresh_answers = {"applies_to": None, "is_pcs": None, "english_variant": None}
-        return {
+        return Command(goto=END, update={
             "pending_upload_id": state.get("conflicting_upload_id"),
             "pending_filename": state.get("conflicting_filename"),
             "pending_file_size_bytes": state.get("conflicting_file_size_bytes"),
             "pending_content_type": state.get("conflicting_content_type"),
             "intake_answers": fresh_answers,
             **_CLEAR_CONFLICT_FIELDS,
+            "requires_user_input": True,
             "messages": [AIMessage(content=_intake_question_text(fresh_answers))],
-        }
+        })
 
     if action == "keep":
-        # C is discarded - it never became the pending upload, so it
-        # needs its own cleanup (it's a genuinely separate staged
-        # record from B, sitting there unused otherwise).
         await abandon_staged_upload(db, state.get("conflicting_upload_id"))
-        return {
+        return Command(goto=END, update={
             **_CLEAR_CONFLICT_FIELDS,
+            "requires_user_input": True,
+            # still True - B's own intake question remains unanswered,
+            # this response re-surfaces it right below.
             "messages": [AIMessage(content=(
                 f"Okay, I'll keep working on {pending_filename}.\n\n"
                 + _intake_question_text(state.get("intake_answers") or {})
             ))],
-        }
+        })
 
     # Fresh conflict, or an unclear response to it - (re-)present the choice.
-    return {
+    return Command(goto=END, update={
+        "requires_user_input": True,
         "messages": [AIMessage(content=(
             f"You still have an unfinished submission for **{pending_filename}**.\n\n"
             f"Would you like to **replace** it with **{conflicting_filename}**, "
             f"or **keep** working on {pending_filename}?"
         ))],
-    }
+    })

@@ -1,16 +1,13 @@
 """
 app/agent/graph.py
 
-PHASE 3B/3C: handle_submit_document is now a PLAIN node (no
-interrupt() - see app/agent/state.py's module docstring for why),
-so it needs a NORMAL static edge to END for its common case (still
-asking a question, turn ends) - which coexists correctly with its
-occasional Command(goto="create_review_job") override once intake
-completes. Confirmed via direct test against our real installed
-langgraph that a static edge and an occasional Command(goto=...)
-from the SAME node do not conflict: Command(goto=...) always wins
-when returned; the static edge only applies when the node returns a
-plain dict instead.
+FIX (final Phase 3B/3C correction pass, item A): handle_submit_document
+and handle_attachment_conflict now return Command(goto=...) for
+EVERY path (no plain dict returns) - so NEITHER has a static edge to
+END mixed in anymore. Only ONE routing mechanism per node, as
+required. Confirmed via direct test against our real installed
+langgraph that Command(goto=END) works correctly with zero static
+edges present for that node at all.
 """
 
 from __future__ import annotations
@@ -25,12 +22,21 @@ from app.agent.nodes.attachment_conflict import handle_attachment_conflict_node
 from app.agent.context import ChatContext
 from app.agent.state import ChatState
 
-_TERMINAL_HANDLER_NODES = {
+# Nodes that always return a plain dict (never Command) - these get a
+# normal static edge to END. handle_submit_document and
+# handle_attachment_conflict are DELIBERATELY excluded - they return
+# Command(goto=...) exclusively, so they get no static edge at all
+# (see each module's own docstring).
+_STATIC_EDGE_NODES = {
     "handle_social": handle_social_node, "handle_off_topic": handle_off_topic_node,
     "handle_knowledge_question": handle_knowledge_question_node,
     "handle_check_status": handle_check_status_node, "handle_finding_followup": handle_finding_followup_node,
     "handle_scope_change": handle_scope_change_node, "handle_additional_output": handle_additional_output_node,
     "handle_unclear": handle_unclear_node,
+}
+
+_COMMAND_ONLY_NODES = {
+    "handle_submit_document": handle_submit_document_node,
     "handle_attachment_conflict": handle_attachment_conflict_node,
 }
 
@@ -39,27 +45,22 @@ def build_graph(checkpointer: BaseCheckpointSaver):
     builder = StateGraph(state_schema=ChatState, context_schema=ChatContext)
 
     builder.add_node("classify_intent", classify_intent_node)
-    builder.add_node("handle_submit_document", handle_submit_document_node)
     builder.add_node("create_review_job", create_review_job_node)
-    for name, fn in _TERMINAL_HANDLER_NODES.items():
+    for name, fn in _STATIC_EDGE_NODES.items():
+        builder.add_node(name, fn)
+    for name, fn in _COMMAND_ONLY_NODES.items():
         builder.add_node(name, fn)
 
     builder.add_edge(START, "classify_intent")
     builder.add_conditional_edges(
         "classify_intent", route_by_intent,
-        [*_TERMINAL_HANDLER_NODES.keys(), "handle_submit_document", END],
+        [*_STATIC_EDGE_NODES.keys(), *_COMMAND_ONLY_NODES.keys(), END],
     )
 
-    # handle_submit_document routes to create_review_job via
-    # Command(goto=...) when intake completes - no conditional edge
-    # needed for that transition (see that module's docstring). It
-    # otherwise ends the turn normally (implicit - a plain dict
-    # return with no goto falls through to this edge):
-    builder.add_edge("handle_submit_document", END)
     builder.add_edge("create_review_job", END)
-
-    for name in _TERMINAL_HANDLER_NODES:
+    for name in _STATIC_EDGE_NODES:
         builder.add_edge(name, END)
+    # No static edges for _COMMAND_ONLY_NODES - they route themselves.
 
     return builder.compile(checkpointer=checkpointer)
 
